@@ -95,13 +95,14 @@ impl Default for PhotonSettings {
 pub struct PhotonTelemetry {
     pub width: u32,
     pub height: u32,
-    pub num_photons: u32,
+    pub mode: PhotonMode,
+    pub dispatched_photons: u32,
     pub substeps: u32,
     pub pass1_step_ms: Option<f64>,
     pub pass2_resolve_ms: Option<f64>,
     pub pass3_agx_ms: Option<f64>,
     pub wall_ms: f64,
-    pub photon_steps_per_sec: f64,
+    pub photon_throughput_per_sec: f64,
     pub accum_frames: u64,
 }
 
@@ -430,12 +431,38 @@ impl PhotonPipeline {
         self.reset_accumulation();
     }
 
-    /// Clear accumulated HDR exposure and respawn all photons on the next frame.
+    /// Clear accumulated HDR exposure and reset deterministic sequence/pulse state.
     pub fn reset_accumulation(&mut self) {
         self.frame_idx = 0;
         self.accum_frames = 0;
         self.pending_clear = true;
         self.pending_pulse = true;
+    }
+
+    /// Clear accumulated HDR exposure for live interactive emitter/camera edits without
+    /// restarting Pulse wavefronts or resetting PRNG temporal decorrelation.
+    pub fn clear_accumulation(&mut self) {
+        self.accum_frames = 0;
+        self.pending_clear = true;
+    }
+
+    /// Active photons dispatched per frame (full end-to-end trajectories in Accumulate mode;
+    /// full persistent pool in Pulse mode).
+    pub fn dispatched_photons(&self, scene: &PhotonScene, mode: PhotonMode) -> u32 {
+        match mode {
+            PhotonMode::Pulse => self.num_photons,
+            PhotonMode::Accumulate => {
+                if scene.id.is_kerr() {
+                    (self.num_photons / 32)
+                        .clamp(256, 32_768)
+                        .min(self.num_photons)
+                } else {
+                    (self.num_photons / 16)
+                        .clamp(256, 65_536)
+                        .min(self.num_photons)
+                }
+            }
+        }
     }
 
     /// Fire a fresh synchronized photon pulse (keeping existing fading trails in Pulse mode).
@@ -503,6 +530,7 @@ impl PhotonPipeline {
             settings.dt_substep
         };
 
+        let active_photons = self.dispatched_photons(scene, settings.mode);
         let sim_u = SimUniforms {
             view: [
                 scene.view_center[0],
@@ -517,7 +545,7 @@ impl PhotonPipeline {
                 scene.emitter_spread,
             ],
             physics: [dt_substep, spin, rp, FIXED_SCALE],
-            dims: [w, h, self.num_photons, settings.substeps.max(1)],
+            dims: [w, h, active_photons, settings.substeps.max(1)],
             flags: [
                 u32::from(is_kerr),
                 settings.mode as u32,
@@ -534,14 +562,17 @@ impl PhotonPipeline {
         gpu.queue
             .write_buffer(&self.sim_uniform_buf, 0, bytemuck::bytes_of(&sim_u));
 
-        // Normalize intensity by pixel density and photon count so switching resolution
-        // or photon count keeps visual brightness consistent!
-        let px_per_photon = ((w as f32) * (h as f32)) / (self.num_photons as f32).max(1.0);
-        let base_gain = if settings.mode == PhotonMode::Pulse {
-            0.0055 * px_per_photon * settings.exposure
-        } else {
-            0.032 * px_per_photon * settings.exposure
+        // Exact step-size-invariant arc-length splatting scales per-pixel density linearly with
+        // (active_photons / height), so multiplying by (height / active_photons) keeps visual
+        // exposure consistent across all resolutions and photon counts.
+        let norm = (h as f32) / (active_photons as f32).max(1.0);
+        let gain_k = match (settings.mode, is_kerr) {
+            (PhotonMode::Accumulate, false) => 0.16,
+            (PhotonMode::Accumulate, true) => 0.14,
+            (PhotonMode::Pulse, false) => 0.70,
+            (PhotonMode::Pulse, true) => 0.42,
         };
+        let base_gain = gain_k * norm * settings.exposure;
         let accum_norm = 1.0 / (self.accum_frames as f32).max(1.0);
 
         let resolve_u = ResolveUniforms {
@@ -575,7 +606,7 @@ impl PhotonPipeline {
             });
             pass.set_pipeline(&self.step_pipeline);
             pass.set_bind_group(0, &self.sized.step_bg, &[]);
-            pass.dispatch_workgroups(self.num_photons.div_ceil(256), 1, 1);
+            pass.dispatch_workgroups(active_photons.div_ceil(256), 1, 1);
         }
 
         {
@@ -673,21 +704,26 @@ impl PhotonPipeline {
 
         let p1 = pass_ms.as_ref().map(|v| v[0]);
         let step_sec = p1.unwrap_or(last_wall_ms) * 1e-3;
-        let total_steps = f64::from(self.num_photons) * f64::from(settings.substeps.max(1));
+        let dispatched = self.dispatched_photons(scene, settings.mode);
+        let work_units = match settings.mode {
+            PhotonMode::Accumulate => f64::from(dispatched),
+            PhotonMode::Pulse => f64::from(dispatched) * f64::from(settings.substeps.max(1)),
+        };
 
         Ok((
             rgba,
             PhotonTelemetry {
                 width: w,
                 height: h,
-                num_photons: self.num_photons,
+                mode: settings.mode,
+                dispatched_photons: dispatched,
                 substeps: settings.substeps.max(1),
                 pass1_step_ms: p1,
                 pass2_resolve_ms: pass_ms.as_ref().map(|v| v[1]),
                 pass3_agx_ms: pass_ms.as_ref().map(|v| v[2]),
                 wall_ms: last_wall_ms,
-                photon_steps_per_sec: if step_sec > 0.0 {
-                    total_steps / step_sec
+                photon_throughput_per_sec: if step_sec > 0.0 {
+                    work_units / step_sec
                 } else {
                     0.0
                 },
@@ -777,19 +813,24 @@ impl PhotonPipeline {
         let med_p2 = (!p2s.is_empty()).then(|| med(&mut p2s));
         let med_p3 = (!p3s.is_empty()).then(|| med(&mut p3s));
         let step_sec = med_p1.unwrap_or(med_wall) * 1e-3;
-        let total_steps = f64::from(self.num_photons) * f64::from(settings.substeps.max(1));
+        let dispatched = self.dispatched_photons(scene, settings.mode);
+        let work_units = match settings.mode {
+            PhotonMode::Accumulate => f64::from(dispatched),
+            PhotonMode::Pulse => f64::from(dispatched) * f64::from(settings.substeps.max(1)),
+        };
 
         Ok(PhotonTelemetry {
             width: w,
             height: h,
-            num_photons: self.num_photons,
+            mode: settings.mode,
+            dispatched_photons: dispatched,
             substeps: settings.substeps.max(1),
             pass1_step_ms: med_p1,
             pass2_resolve_ms: med_p2,
             pass3_agx_ms: med_p3,
             wall_ms: med_wall,
-            photon_steps_per_sec: if step_sec > 0.0 {
-                total_steps / step_sec
+            photon_throughput_per_sec: if step_sec > 0.0 {
+                work_units / step_sec
             } else {
                 0.0
             },

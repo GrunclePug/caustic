@@ -393,16 +393,27 @@ fn print_photon_telemetry(label: &str, t: &PhotonTelemetry) {
         .pass3_agx_ms
         .map(|v| format!("{v:.2} ms"))
         .unwrap_or_else(|| "n/a".into());
-    println!(
-        "{label} ({}x{}, {:.2}M photons x{} substeps): Step={p1}, Resolve={p2}, AgX={p3}, wall={:.2} ms, {:.2} B photon-steps/s | frames={}",
-        t.width,
-        t.height,
-        f64::from(t.num_photons) * 1e-6,
-        t.substeps,
-        t.wall_ms,
-        t.photon_steps_per_sec * 1e-9,
-        t.accum_frames,
-    );
+    match t.mode {
+        PhotonMode::Accumulate => println!(
+            "{label} ({}x{}, {:.1}K full paths/f): Step={p1}, Resolve={p2}, AgX={p3}, wall={:.2} ms, {:.2} M full paths/s | frames={}",
+            t.width,
+            t.height,
+            f64::from(t.dispatched_photons) * 1e-3,
+            t.wall_ms,
+            t.photon_throughput_per_sec * 1e-6,
+            t.accum_frames,
+        ),
+        PhotonMode::Pulse => println!(
+            "{label} ({}x{}, {:.2}M photons x{} substeps): Step={p1}, Resolve={p2}, AgX={p3}, wall={:.2} ms, {:.2} B photon-steps/s | frames={}",
+            t.width,
+            t.height,
+            f64::from(t.dispatched_photons) * 1e-6,
+            t.substeps,
+            t.wall_ms,
+            t.photon_throughput_per_sec * 1e-9,
+            t.accum_frames,
+        ),
+    }
 }
 
 fn angle_wrap(a: f64, b: f64) -> f64 {

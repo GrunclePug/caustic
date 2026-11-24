@@ -61,5 +61,25 @@ fn lavapipe_prism_and_kerr_beam_render_deterministically() {
             "scene {} output differed across identical seeded runs",
             scene_id.name()
         );
+
+        // Verify a SINGLE frame (as during continuous live emitter dragging/aiming)
+        // traces complete end-to-end trajectories all the way into the right half of the frame!
+        let (img_single, _) = p1
+            .render_headless(&gpu, &scene, &settings, 1)
+            .expect("single-frame live-drag lavapipe photon render");
+        let mut right_half_lit = 0_usize;
+        for py in 0..72_usize {
+            for px in 64..128_usize {
+                let i = (py * 128 + px) * 4;
+                if img_single[i] > 35 || img_single[i + 1] > 35 || img_single[i + 2] > 35 {
+                    right_half_lit += 1;
+                }
+            }
+        }
+        assert!(
+            right_half_lit > 40,
+            "scene {} single-frame live drag expected > 40 lit pixels in right half, got {right_half_lit}",
+            scene_id.name()
+        );
     }
 }

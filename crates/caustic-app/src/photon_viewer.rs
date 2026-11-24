@@ -39,6 +39,7 @@ struct PhotonViewerApp {
     gfx: Option<PhotonGfx>,
     left_drag: bool,
     right_drag: bool,
+    last_cursor: Option<(f64, f64)>,
     last_title_update: Instant,
     fps_frames: u32,
     fps_accum_ms: f64,
@@ -63,6 +64,7 @@ impl PhotonViewerApp {
             gfx: None,
             left_drag: false,
             right_drag: false,
+            last_cursor: None,
             last_title_update: Instant::now(),
             fps_frames: 0,
             fps_accum_ms: 0.0,
@@ -198,10 +200,16 @@ impl PhotonViewerApp {
             } else {
                 format!("disp={:.2}x", self.scene.dispersion_scale)
             };
+            let dispatched = gfx
+                .pipeline
+                .dispatched_photons(&self.scene, self.settings.mode);
+            let count_str = match self.settings.mode {
+                PhotonMode::Accumulate => format!("{:.1}K paths/f", f64::from(dispatched) * 1e-3),
+                PhotonMode::Pulse => format!("{:.2}M photons", f64::from(dispatched) * 1e-6),
+            };
             let title = format!(
-                "caustic photons | {} ({mode_str}) | {:.2}M photons | {extra} | exp={:.2} | f={} | {:.1}ms",
+                "caustic photons | {} ({mode_str}) | {count_str} | {extra} | exp={:.2} | f={} | {:.1}ms",
                 self.scene.id.name(),
-                f64::from(self.settings.num_photons) * 1e-6,
                 self.settings.exposure,
                 gfx.pipeline.accum_frames(),
                 avg_ms,
@@ -243,7 +251,7 @@ impl PhotonViewerApp {
                 if let Some(gfx) = &mut self.gfx
                     && self.settings.mode == PhotonMode::Accumulate
                 {
-                    gfx.pipeline.reset_accumulation();
+                    gfx.pipeline.clear_accumulation();
                 }
             }
             KeyCode::KeyE => {
@@ -251,7 +259,29 @@ impl PhotonViewerApp {
                 if let Some(gfx) = &mut self.gfx
                     && self.settings.mode == PhotonMode::Accumulate
                 {
-                    gfx.pipeline.reset_accumulation();
+                    gfx.pipeline.clear_accumulation();
+                }
+            }
+            KeyCode::Comma => {
+                self.scene.emitter_spread = (self.scene.emitter_spread / 1.15).max(0.03);
+                if let Some(gfx) = &mut self.gfx
+                    && self.settings.mode == PhotonMode::Accumulate
+                {
+                    gfx.pipeline.clear_accumulation();
+                }
+            }
+            KeyCode::Period => {
+                let max_spread = if self.scene.id.is_kerr() { 20.0 } else { 6.0 };
+                self.scene.emitter_spread = (self.scene.emitter_spread * 1.15).min(max_spread);
+                if let Some(gfx) = &mut self.gfx
+                    && self.settings.mode == PhotonMode::Accumulate
+                {
+                    gfx.pipeline.clear_accumulation();
+                }
+            }
+            KeyCode::KeyC => {
+                if let Some(gfx) = &mut self.gfx {
+                    gfx.pipeline.clear_accumulation();
                 }
             }
             KeyCode::BracketRight => {
@@ -259,12 +289,12 @@ impl PhotonViewerApp {
                     self.scene.spin = (self.scene.spin + 0.05).clamp(-0.998, 0.998);
                 } else {
                     self.scene.dispersion_scale = (self.scene.dispersion_scale * 1.15).min(4.0);
-                    self.scene.rebuild_geometry();
+                    self.scene.rebuild_primitives();
                 }
                 if let Some(gfx) = &mut self.gfx {
                     gfx.pipeline.upload_scene(&gfx.gpu, &self.scene);
                     if self.settings.mode == PhotonMode::Accumulate {
-                        gfx.pipeline.reset_accumulation();
+                        gfx.pipeline.clear_accumulation();
                     }
                 }
             }
@@ -273,12 +303,12 @@ impl PhotonViewerApp {
                     self.scene.spin = (self.scene.spin - 0.05).clamp(-0.998, 0.998);
                 } else {
                     self.scene.dispersion_scale = (self.scene.dispersion_scale / 1.15).max(0.1);
-                    self.scene.rebuild_geometry();
+                    self.scene.rebuild_primitives();
                 }
                 if let Some(gfx) = &mut self.gfx {
                     gfx.pipeline.upload_scene(&gfx.gpu, &self.scene);
                     if self.settings.mode == PhotonMode::Accumulate {
-                        gfx.pipeline.reset_accumulation();
+                        gfx.pipeline.clear_accumulation();
                     }
                 }
             }
@@ -391,19 +421,50 @@ impl ApplicationHandler for PhotonViewerApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left => self.left_drag = down,
-                    MouseButton::Right => self.right_drag = down,
+                    MouseButton::Left => {
+                        self.left_drag = down;
+                        if down
+                            && let Some((cx, cy)) = self.last_cursor
+                            && let Some(world) = self.cursor_to_world(cx, cy)
+                        {
+                            self.scene.emitter_pos = world;
+                            if let Some(gfx) = &mut self.gfx
+                                && self.settings.mode == PhotonMode::Accumulate
+                            {
+                                gfx.pipeline.clear_accumulation();
+                            }
+                        }
+                    }
+                    MouseButton::Right => {
+                        self.right_drag = down;
+                        if down
+                            && let Some((cx, cy)) = self.last_cursor
+                            && let Some(world) = self.cursor_to_world(cx, cy)
+                        {
+                            let dx = world[0] - self.scene.emitter_pos[0];
+                            let dy = world[1] - self.scene.emitter_pos[1];
+                            if dx * dx + dy * dy > 1e-6 {
+                                self.scene.emitter_angle = dy.atan2(dx);
+                                if let Some(gfx) = &mut self.gfx
+                                    && self.settings.mode == PhotonMode::Accumulate
+                                {
+                                    gfx.pipeline.clear_accumulation();
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.last_cursor = Some((position.x, position.y));
                 if let Some(world) = self.cursor_to_world(position.x, position.y) {
                     if self.left_drag {
                         self.scene.emitter_pos = world;
                         if let Some(gfx) = &mut self.gfx
                             && self.settings.mode == PhotonMode::Accumulate
                         {
-                            gfx.pipeline.reset_accumulation();
+                            gfx.pipeline.clear_accumulation();
                         }
                     } else if self.right_drag {
                         let dx = world[0] - self.scene.emitter_pos[0];
@@ -413,7 +474,7 @@ impl ApplicationHandler for PhotonViewerApp {
                             if let Some(gfx) = &mut self.gfx
                                 && self.settings.mode == PhotonMode::Accumulate
                             {
-                                gfx.pipeline.reset_accumulation();
+                                gfx.pipeline.clear_accumulation();
                             }
                         }
                     }
@@ -427,7 +488,7 @@ impl ApplicationHandler for PhotonViewerApp {
                 self.scene.view_half_height =
                     (self.scene.view_half_height * (-scroll * 0.08).exp()).clamp(1.0, 60.0);
                 if let Some(gfx) = &mut self.gfx {
-                    gfx.pipeline.reset_accumulation();
+                    gfx.pipeline.clear_accumulation();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {

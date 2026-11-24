@@ -125,24 +125,15 @@ impl PhotonScene {
         s
     }
 
-    /// Rebuild analytical scene geometry (called on preset switch or dispersion change).
-    pub fn rebuild_geometry(&mut self) {
+    /// Rebuild analytical scene primitives (preserving current emitter and view state).
+    pub fn rebuild_primitives(&mut self) {
         self.segments.clear();
         self.circles.clear();
         let disp = self.dispersion_scale.clamp(0.1, 4.0);
 
         match self.id {
             PhotonSceneId::Prism => {
-                self.view_half_height = 4.6;
-                self.view_center = [0.6, -0.2];
-                self.emitter_pos = [-6.2, -1.55];
-                self.emitter_angle = 0.48;
-                self.emitter_spread = 0.22;
-                self.emitter_kind = EMITTER_BEAM;
-
                 // Equilateral flint glass prism centered near (-0.8, 0.0), CCW vertices.
-                // Incidence angle ~57.5 deg keeps the entire 380..780 nm spectrum below TIR
-                // on the exit face while fanning a vivid ~21 deg rainbow across the right half.
                 let cx = -0.8_f32;
                 let cy = 0.0_f32;
                 let r = 2.6_f32;
@@ -169,32 +160,16 @@ impl PhotonScene {
                 });
             }
             PhotonSceneId::Cardioid => {
-                // Classic circular coffee-cup mirror producing the exact nephroid caustic!
-                self.view_half_height = 4.8;
-                self.view_center = [0.0, 0.0];
-                self.emitter_pos = [-7.2, 0.0];
-                self.emitter_angle = 0.0;
-                self.emitter_spread = 3.55;
-                self.emitter_kind = EMITTER_BEAM;
-
                 // Open semicircular mirror centered at origin, radius 3.8, facing left (-x)
-                // so a parallel beam from the left enters freely and reflects into the nephroid!
+                // so a parallel beam from the left enters freely and reflects into the nephroid.
                 self.circles.push(OptCircle {
                     geom: [0.0, 0.0, 3.8, 0.0],
-                    clip_arc: [0.0, 0.0, -0.25, 0.0], // arc covering ~210 deg around +x (right side)
+                    clip_arc: [0.0, 0.0, -0.25, 0.0],
                     material: [1.0, 0.0, 0.0, 0.0],
                     meta: [MAT_MIRROR, 1, 0, 0],
                 });
             }
             PhotonSceneId::Lens => {
-                // Thick dispersive biconvex glass lens (exact intersection of two circles!)
-                self.view_half_height = 4.8;
-                self.view_center = [1.0, 0.0];
-                self.emitter_pos = [-6.5, 0.0];
-                self.emitter_angle = 0.0;
-                self.emitter_spread = 2.6;
-                self.emitter_kind = EMITTER_BEAM;
-
                 let r_lens = 4.6_f32;
                 let offset = 3.3_f32;
                 let cx_l = -1.5_f32;
@@ -215,8 +190,38 @@ impl PhotonScene {
                     meta: [MAT_GLASS, 0, 0, 0],
                 });
             }
+            PhotonSceneId::KerrBeam | PhotonSceneId::KerrPulsar => {}
+        }
+    }
+
+    /// Reset emitter, camera framing, and analytical geometry to the preset defaults.
+    pub fn rebuild_geometry(&mut self) {
+        match self.id {
+            PhotonSceneId::Prism => {
+                self.view_half_height = 4.6;
+                self.view_center = [0.6, -0.2];
+                self.emitter_pos = [-6.2, -1.55];
+                self.emitter_angle = 0.48;
+                self.emitter_spread = 0.22;
+                self.emitter_kind = EMITTER_BEAM;
+            }
+            PhotonSceneId::Cardioid => {
+                self.view_half_height = 4.8;
+                self.view_center = [0.0, 0.0];
+                self.emitter_pos = [-7.2, 0.0];
+                self.emitter_angle = 0.0;
+                self.emitter_spread = 3.55;
+                self.emitter_kind = EMITTER_BEAM;
+            }
+            PhotonSceneId::Lens => {
+                self.view_half_height = 4.8;
+                self.view_center = [1.0, 0.0];
+                self.emitter_pos = [-6.5, 0.0];
+                self.emitter_angle = 0.0;
+                self.emitter_spread = 2.6;
+                self.emitter_kind = EMITTER_BEAM;
+            }
             PhotonSceneId::KerrBeam => {
-                // Collimated relativistic laser beam grazing a spinning Kerr black hole (Ingoing KS)!
                 self.view_half_height = 14.0;
                 self.view_center = [2.4, 0.0];
                 self.emitter_pos = [-18.5, 0.0];
@@ -225,7 +230,6 @@ impl PhotonScene {
                 self.emitter_kind = EMITTER_BEAM;
             }
             PhotonSceneId::KerrPulsar => {
-                // Isotropic point beacon emitting 360-degree relativistic photon wavefronts!
                 self.view_half_height = 13.5;
                 self.view_center = [1.2, 0.0];
                 self.emitter_pos = [-8.5, 0.0];
@@ -234,5 +238,6 @@ impl PhotonScene {
                 self.emitter_kind = EMITTER_POINT;
             }
         }
+        self.rebuild_primitives();
     }
 }
