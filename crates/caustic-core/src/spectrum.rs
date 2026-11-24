@@ -1,15 +1,6 @@
-//! Physically-based Page-Thorne (1974) relativistic thin accretion disk flux/temperature
-//! profile and CIE 1931 -> linear Rec.709 log-XYZ blackbody spectral radiance LUT.
-//!
-//! Because `I_{nu, obs} = g^3 B_{nu / g}(T_emit) = B_nu(g * T_emit)`, evaluating the
-//! absolute spectral blackbody radiance at `T_obs = g * T_emit` carries both the exact
-//! Planckian color shift AND the relativistic `g^4` bolometric beaming with zero
-//! double-counting.
+//! CIE 1931 2-degree colorimetry, spectral wavelength-to-RGB LUTs, and
+//! Planckian log-XYZ blackbody spectral radiance LUTs.
 
-use super::kerr::r_isco;
-
-/// Number of entries in the Page-Thorne radial temperature LUT.
-pub const DISK_LUT_LEN: usize = 512;
 /// Number of entries in the log-temperature CIE XYZ blackbody LUT.
 pub const BLACKBODY_LUT_LEN: usize = 1024;
 /// Minimum blackbody temperature (K) before clamping to black.
@@ -19,80 +10,24 @@ pub const BLACKBODY_T_MAX: f64 = 400_000.0;
 /// Reference temperature (K) whose luminance `Y(T_ref)` normalizes log-XYZ storage.
 pub const BLACKBODY_T_REF: f64 = 6_500.0;
 
+/// Number of entries in the visible wavelength (`380..780 nm`) spectral Rec.709 LUT.
+pub const SPECTRAL_LUT_LEN: usize = 256;
+/// Minimum visible wavelength in nanometers.
+pub const LAMBDA_MIN_NM: f64 = 380.0;
+/// Maximum visible wavelength in nanometers.
+pub const LAMBDA_MAX_NM: f64 = 780.0;
+
 /// Physical constants (SI) for Planck's law.
 const PLANCK_H: f64 = 6.626_070_15e-34;
 const SPEED_C: f64 = 2.997_924_58e8;
 const BOLTZMANN_K: f64 = 1.380_649e-23;
 
-/// Exact Page-Thorne (1974, Eq. 15n) dimensionless relativistic accretion disk flux `f(r)`.
-///
-/// Returns `0.0` for `r <= r_ISCO(a)`.
-pub fn page_thorne_flux(r: f64, a: f64) -> f64 {
-    let r_in = r_isco(a);
-    if r <= r_in {
-        return 0.0;
-    }
-    let x = r.sqrt();
-    let x0 = r_in.sqrt();
-    let denom = x * x * (x * x * x - 3.0 * x + 2.0 * a);
-    if denom <= 0.0 {
-        return 0.0;
-    }
-
-    let bracket = if a.abs() < 1e-6 {
-        // Smooth Schwarzschild limit (avoids 0/0 in the x2 -> 0 root term).
-        let s3 = 3.0_f64.sqrt();
-        let num = (x - s3) * (x0 + s3);
-        let den = (x + s3) * (x0 - s3);
-        (x - x0) - 0.5 * s3 * (num / den).ln()
-    } else {
-        let theta = a.clamp(-0.999999, 0.999999).acos() / 3.0;
-        let x1 = 2.0 * (theta - std::f64::consts::FRAC_PI_3).cos();
-        let x2 = 2.0 * (theta + std::f64::consts::FRAC_PI_3).cos();
-        let x3 = -2.0 * theta.cos();
-
-        let term = |xi: f64, xj: f64, xk: f64| -> f64 {
-            let coeff = 3.0 * (xi - a) * (xi - a) / (xi * (xi - xj) * (xi - xk));
-            coeff * ((x - xi) / (x0 - xi)).abs().ln()
-        };
-
-        (x - x0) - 1.5 * a * (x / x0).ln() - term(x1, x2, x3) - term(x2, x1, x3) - term(x3, x1, x2)
-    };
-
-    (1.5 * bracket / denom).max(0.0)
-}
-
-/// Build the normalized Page-Thorne effective temperature LUT `T_emit(r) / T_peak` in `f32`.
-///
-/// Sampled uniformly in `s = sqrt((r - r_ISCO) / (r_out - r_ISCO))` in `[0, 1]` because
-/// `T(r) ~ sqrt(r - r_ISCO)` near the inner edge, making `T(s)` linear at `s = 0`!
-pub fn build_disk_temp_lut(a: f64, r_out: f64) -> Vec<f32> {
-    let r_in = r_isco(a);
-    let span = (r_out - r_in).max(1e-6);
-
-    // Find global peak flux over the full disk (and slightly beyond in case r_out is compact).
-    let mut f_max = 0.0_f64;
-    let mut raw = Vec::with_capacity(DISK_LUT_LEN);
-    for i in 0..DISK_LUT_LEN {
-        let s = (i as f64) / ((DISK_LUT_LEN - 1) as f64);
-        let r = r_in + span * s * s;
-        let f = page_thorne_flux(r, a);
-        f_max = f_max.max(f);
-        raw.push(f);
-    }
-
-    if f_max <= 0.0 {
-        return vec![0.0; DISK_LUT_LEN];
-    }
-
-    raw.into_iter()
-        .map(|f| (f / f_max).powf(0.25) as f32)
-        .collect()
-}
-
 /// Piecewise Gaussian approximation to CIE 1931 2-degree color matching functions
 /// (Wyman, Sloan, & Shirley, JCGT 2013), wavelength `lambda_nm` in nanometers.
 pub fn cie_1931_xyz(lambda_nm: f64) -> [f64; 3] {
+    if !(360.0..=830.0).contains(&lambda_nm) {
+        return [0.0; 3];
+    }
     let t1 = (lambda_nm - 442.0) * if lambda_nm < 442.0 { 0.0624 } else { 0.0374 };
     let t2 = (lambda_nm - 599.8) * if lambda_nm < 599.8 { 0.0264 } else { 0.0323 };
     let t3 = (lambda_nm - 501.1) * if lambda_nm < 501.1 { 0.0490 } else { 0.0382 };
@@ -108,6 +43,52 @@ pub fn cie_1931_xyz(lambda_nm: f64) -> [f64; 3] {
     let z = 1.217 * (-0.5 * v1 * v1).exp() + 0.681 * (-0.5 * v2 * v2).exp();
 
     [x.max(0.0), y.max(0.0), z.max(0.0)]
+}
+
+/// Convert CIE 1931 XYZ to linear Rec.709 RGB with soft luminance-preserving gamut mapping.
+pub fn xyz_to_rec709_soft(xyz: [f64; 3]) -> [f64; 3] {
+    let r = 3.2404542 * xyz[0] - 1.5371385 * xyz[1] - 0.4985314 * xyz[2];
+    let g = -0.9692660 * xyz[0] + 1.8760108 * xyz[1] + 0.0415560 * xyz[2];
+    let b = 0.0556434 * xyz[0] - 0.2040259 * xyz[1] + 1.0572252 * xyz[2];
+    let min_c = r.min(g).min(b);
+    if min_c < 0.0 {
+        let y = xyz[1].max(0.0);
+        let alpha = (y / (y - min_c).max(1e-12)).clamp(0.0, 1.0);
+        [
+            (y + alpha * (r - y)).max(0.0),
+            (y + alpha * (g - y)).max(0.0),
+            (y + alpha * (b - y)).max(0.0),
+        ]
+    } else {
+        [r, g, b]
+    }
+}
+
+/// Build a 256-entry `f32` spectral LUT mapping wavelength `lambda in [380, 780] nm`
+/// to CIE 1931 XYZ tristimulus `[X, Y, Z, 0.0]` normalized so equal-energy white
+/// integrates to `(1, 1, 1)` luminance-balanced XYZ (converting XYZ -> Rec.709 after
+/// summing across wavelengths preserves true physical color mixing!).
+pub fn build_spectral_xyz_lut() -> Vec<[f32; 4]> {
+    let mut raw = Vec::with_capacity(SPECTRAL_LUT_LEN);
+    let mut sum_y = 0.0_f64;
+    for i in 0..SPECTRAL_LUT_LEN {
+        let frac = (i as f64) / ((SPECTRAL_LUT_LEN - 1) as f64);
+        let lam = LAMBDA_MIN_NM + frac * (LAMBDA_MAX_NM - LAMBDA_MIN_NM);
+        let xyz = cie_1931_xyz(lam);
+        sum_y += xyz[1];
+        raw.push(xyz);
+    }
+    let scale = (SPECTRAL_LUT_LEN as f64) / sum_y.max(1e-12);
+    raw.into_iter()
+        .map(|xyz| {
+            [
+                (xyz[0] * scale) as f32,
+                (xyz[1] * scale) as f32,
+                (xyz[2] * scale) as f32,
+                0.0,
+            ]
+        })
+        .collect()
 }
 
 /// Planck spectral radiance `B_lambda(lambda_m, T)` in `W / (sr m^3)`.
@@ -130,8 +111,8 @@ pub fn integrate_blackbody_xyz(temp_k: f64) -> [f64; 3] {
         return [0.0; 3];
     }
     let n = 400_usize;
-    let l0 = 380.0_f64;
-    let l1 = 780.0_f64;
+    let l0 = LAMBDA_MIN_NM;
+    let l1 = LAMBDA_MAX_NM;
     let dl_nm = (l1 - l0) / (n as f64);
     let mut xyz = [0.0_f64; 3];
 
@@ -156,12 +137,8 @@ pub fn integrate_blackbody_xyz(temp_k: f64) -> [f64; 3] {
 }
 
 /// CPU-precomputed `f32` log-CIE-XYZ blackbody LUT sampled log-uniformly in `T`.
-///
-/// Each entry stores `[ln(X / Y_ref), ln(Y / Y_ref), ln(Z / Y_ref), 0.0]`.
-/// Storing strictly positive log-XYZ prevents `log(negative)` on out-of-gamut low-T
-/// linear Rec.709 channels and avoids `Rgba16Float` overflow before exposure scaling.
 pub struct BlackbodyLut {
-    /// Packed `[f32; 4]` entries for direct GPU `array<vec4<f32>>` upload.
+    /// Packed `[f32; 4]` entries `[ln(X/Y_ref), ln(Y/Y_ref), ln(Z/Y_ref), 0.0]`.
     pub entries: Vec<[f32; 4]>,
     /// Reference luminance `Y(BLACKBODY_T_REF)` used to normalize the LUT.
     pub y_ref: f64,
@@ -189,8 +166,7 @@ impl BlackbodyLut {
         Self { entries, y_ref }
     }
 
-    /// Evaluate normalized CIE XYZ radiance at observed temperature `temp_k` (K)
-    /// using the exact same log-temperature interpolation as the WGSL shader.
+    /// Evaluate normalized CIE XYZ radiance at observed temperature `temp_k` (K).
     pub fn sample_xyz(&self, temp_k: f64) -> [f64; 3] {
         if temp_k < BLACKBODY_T_MIN {
             return [0.0; 3];
@@ -220,27 +196,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn page_thorne_flux_properties() {
-        for a in [-0.998_f64, 0.0, 0.9, 0.998] {
-            let rin = r_isco(a);
-            assert_eq!(page_thorne_flux(rin, a), 0.0);
-            assert_eq!(page_thorne_flux(rin - 0.1, a), 0.0);
-            assert!(page_thorne_flux(rin + 0.5, a) > 0.0);
-            let lut = build_disk_temp_lut(a, 20.0);
-            assert_eq!(lut[0], 0.0);
-            let max_v = lut.iter().copied().fold(0.0_f32, f32::max);
-            assert!((max_v - 1.0).abs() < 1e-6);
+    fn spectral_xyz_lut_integrates_to_neutral_white() {
+        let lut = build_spectral_xyz_lut();
+        let mut sum = [0.0_f64; 3];
+        for e in &lut {
+            for c in 0..3 {
+                assert!(e[c] >= 0.0);
+                sum[c] += f64::from(e[c]);
+            }
         }
+        let mean_y = sum[1] / (lut.len() as f64);
+        assert!((mean_y - 1.0).abs() < 1e-6);
+        // Equal-energy white has X ~ Y ~ Z ~ 1.0
+        assert!((sum[0] / sum[1] - 1.0).abs() < 0.05);
+        assert!((sum[2] / sum[1] - 1.0).abs() < 0.05);
     }
 
     #[test]
-    fn test1_blackbody_lut_matches_shifted_spectral_quadrature() {
-        // Verify that evaluating the log-XYZ LUT at T_obs = g * T_emit matches direct
-        // numerical quadrature of int g^5 B_{g*lambda}(T_emit) * CMF(lambda) dlambda
-        // (equivalently int g^3 B_{nu/g}(T_emit) * CMF(nu) dnu) within < 0.5% relative error,
-        // proving both spectral shift AND g^4 bolometric beaming with NO g^8 double-count!
+    fn blackbody_lut_matches_shifted_spectral_quadrature() {
         let lut = BlackbodyLut::build();
-
         let temps = [500.0_f64, 1_200.0, 3_500.0, 6_500.0, 15_000.0, 100_000.0];
         let gs = [0.25_f64, 0.5, 1.0, 1.8, 3.5];
 
@@ -250,17 +224,12 @@ mod tests {
                 if !(400.0..=BLACKBODY_T_MAX).contains(&t_obs) {
                     continue;
                 }
-
-                // Direct Lorentz-invariant spectral quadrature:
-                // I_{lambda, obs} = g^5 * B_lambda(g * lambda_obs, T_emit)
                 let n = 400_usize;
-                let l0 = 380.0_f64;
-                let l1 = 780.0_f64;
-                let dl_nm = (l1 - l0) / (n as f64);
+                let dl_nm = (LAMBDA_MAX_NM - LAMBDA_MIN_NM) / (n as f64);
                 let mut direct = [0.0_f64; 3];
                 let g5 = g.powi(5);
                 for i in 0..=n {
-                    let lam_nm = l0 + (i as f64) * dl_nm;
+                    let lam_nm = LAMBDA_MIN_NM + (i as f64) * dl_nm;
                     let lam_obs_m = lam_nm * 1e-9;
                     let b_obs = g5 * planck_lambda(g * lam_obs_m, t_emit);
                     let cmf = cie_1931_xyz(lam_nm);
@@ -279,10 +248,8 @@ mod tests {
                 for v in &mut direct {
                     *v *= scale;
                 }
-
                 let got = lut.sample_xyz(t_obs);
                 for c in 0..3 {
-                    // Check relative error for non-underflowed channels (> 1e-12 of peak luminance).
                     if direct[c] > 1e-12 * direct[1].max(1e-30) {
                         let rel_err = (got[c] - direct[c]).abs() / direct[c];
                         assert!(

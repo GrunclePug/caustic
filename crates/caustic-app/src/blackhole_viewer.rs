@@ -17,12 +17,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::engine::gpu::GpuContext;
-use crate::engine::post::{DebugView, write_rgba8_png};
-use crate::sim::blackhole::gpu_tracer::{BlackHolePipeline, FrameView, RenderSettings};
-use crate::sim::blackhole::kerr::{
+use caustic_blackhole::gpu_tracer::{BlackHolePipeline, FrameView, RenderSettings};
+use caustic_blackhole::kerr::{
     Camera, KerrParams, MAX_CAMERA_RADIUS, MAX_SPIN, MIN_CAMERA_HORIZON_MARGIN, r_plus,
 };
+use caustic_core::gpu::GpuContext;
+use caustic_core::post::{DebugView, write_rgba8_png};
 
 const SETTLE_DELAY: Duration = Duration::from_millis(120);
 

@@ -1,5 +1,8 @@
-//! Caustic CLI: headless rendering, RTX 4080 / lavapipe benchmarking, cross-formulation
-//! GR physics verification, and interactive windowed orbit viewer.
+//! Caustic CLI: general-relativistic Kerr black hole tracer and real-time forward
+//! spectral photon simulator.
+
+mod blackhole_viewer;
+mod photon_viewer;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -8,20 +11,24 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use glam::DVec3;
 
-use caustic::engine::gpu::GpuContext;
-use caustic::engine::post::{DebugView, write_rgba8_png};
-use caustic::engine::viewer::run_viewer;
-use caustic::sim::blackhole::gpu_tracer::{BlackHolePipeline, FrameTelemetry, RenderSettings};
-use caustic::sim::blackhole::kerr::{
+use caustic_blackhole::gpu_tracer::{BlackHolePipeline, FrameTelemetry, RenderSettings};
+use caustic_blackhole::kerr::{
     Camera, KerrParams, MAX_CAMERA_RADIUS, MAX_SPIN, MIN_CAMERA_HORIZON_MARGIN, r_isco, r_plus,
 };
-use caustic::sim::blackhole::oracle::{RayStatus, trace_oracle_pixel};
+use caustic_blackhole::oracle::{RayStatus, trace_oracle_pixel};
+use caustic_core::gpu::GpuContext;
+use caustic_core::post::{DebugView, write_rgba8_png};
+use caustic_photons::gpu_sim::{PhotonPipeline, PhotonSettings, PhotonTelemetry};
+use caustic_photons::scene::{PhotonMode, PhotonScene, PhotonSceneId};
+
+use crate::blackhole_viewer::run_viewer;
+use crate::photon_viewer::run_photon_viewer;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "caustic",
     version,
-    about = "GPU-accelerated general-relativistic Kerr black hole and physics simulator"
+    about = "GPU-accelerated general-relativistic Kerr black hole and spectral photon simulator"
 )]
 struct Cli {
     /// Force software Vulkan adapter (lavapipe) instead of hardware GPU.
@@ -47,6 +54,42 @@ impl From<DebugViewArg> for DebugView {
             DebugViewArg::Steps => Self::StepHeatmap,
             DebugViewArg::Redshift => Self::Redshift,
             DebugViewArg::HitClass => Self::HitClass,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PhotonSceneArg {
+    Prism,
+    Cardioid,
+    Lens,
+    KerrBeam,
+    KerrPulsar,
+}
+
+impl From<PhotonSceneArg> for PhotonSceneId {
+    fn from(value: PhotonSceneArg) -> Self {
+        match value {
+            PhotonSceneArg::Prism => Self::Prism,
+            PhotonSceneArg::Cardioid => Self::Cardioid,
+            PhotonSceneArg::Lens => Self::Lens,
+            PhotonSceneArg::KerrBeam => Self::KerrBeam,
+            PhotonSceneArg::KerrPulsar => Self::KerrPulsar,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PhotonModeArg {
+    Accumulate,
+    Pulse,
+}
+
+impl From<PhotonModeArg> for PhotonMode {
+    fn from(value: PhotonModeArg) -> Self {
+        match value {
+            PhotonModeArg::Accumulate => Self::Accumulate,
+            PhotonModeArg::Pulse => Self::Pulse,
         }
     }
 }
@@ -140,9 +183,110 @@ impl SceneArgs {
     }
 }
 
+#[derive(Debug, Clone, Args)]
+struct PhotonArgs {
+    /// Forward photon scene preset.
+    #[arg(long, value_enum, default_value_t = PhotonSceneArg::Prism)]
+    scene: PhotonSceneArg,
+
+    /// Accumulation (long-exposure caustics) or live Pulse wavefront flight.
+    #[arg(long, value_enum, default_value_t = PhotonModeArg::Accumulate)]
+    mode: PhotonModeArg,
+
+    /// Number of simultaneously simulated forward photon packets.
+    #[arg(long, default_value_t = 1_000_000)]
+    photons: u32,
+
+    /// Simulation substeps per frame.
+    #[arg(long, default_value_t = 4)]
+    substeps: u32,
+
+    /// Kerr spin a in [-0.998, +0.998] (for kerr-beam / kerr-pulsar).
+    #[arg(long, default_value_t = 0.95, allow_hyphen_values = true)]
+    spin: f32,
+
+    /// Glass dispersion scale multiplier (for prism / lens).
+    #[arg(long, default_value_t = 1.0)]
+    dispersion: f32,
+
+    /// Exposure multiplier.
+    #[arg(long, default_value_t = 1.0)]
+    exposure: f32,
+
+    /// Deterministic PRNG seed.
+    #[arg(long, default_value_t = 42)]
+    seed: u32,
+}
+
+impl PhotonArgs {
+    fn to_parts(&self) -> (PhotonScene, PhotonSettings) {
+        let mut scene = PhotonScene::preset(self.scene.into());
+        scene.spin = self.spin.clamp(-0.998, 0.998);
+        scene.dispersion_scale = self.dispersion.clamp(0.1, 4.0);
+        if !scene.id.is_kerr() {
+            scene.rebuild_geometry();
+        }
+        let settings = PhotonSettings {
+            num_photons: self.photons.max(256),
+            substeps: self.substeps.max(1),
+            mode: self.mode.into(),
+            exposure: self.exposure,
+            seed: self.seed,
+            ..PhotonSettings::default()
+        };
+        (scene, settings)
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum PhotonCommand {
+    /// Launch the interactive real-time forward photon viewer.
+    View {
+        #[command(flatten)]
+        args: PhotonArgs,
+        /// Initial window width in pixels.
+        #[arg(long, default_value_t = 1280)]
+        width: u32,
+        /// Initial window height in pixels.
+        #[arg(long, default_value_t = 720)]
+        height: u32,
+    },
+    /// Step the forward photon simulation headlessly and write a PNG screenshot.
+    Render {
+        #[command(flatten)]
+        args: PhotonArgs,
+        /// Output image width in pixels.
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        /// Output image height in pixels.
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        /// Number of frames to step before capturing.
+        #[arg(long, default_value_t = 120)]
+        frames: u32,
+        /// Output PNG file path.
+        #[arg(short, long, default_value = "photons.png")]
+        output: PathBuf,
+    },
+    /// Benchmark forward photon simulation throughput on the active GPU.
+    Bench {
+        #[command(flatten)]
+        args: PhotonArgs,
+        /// Output image width in pixels.
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        /// Output image height in pixels.
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        /// Number of timed iterations.
+        #[arg(long, default_value_t = 25)]
+        iters: usize,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Launch the interactive windowed orbit viewer.
+    /// Launch the interactive windowed Kerr black hole orbit viewer.
     View {
         #[command(flatten)]
         scene: SceneArgs,
@@ -153,7 +297,7 @@ enum Command {
         #[arg(long, default_value_t = 720)]
         height: u32,
     },
-    /// Render a single deterministic frame headlessly to a PNG file and print telemetry.
+    /// Render a single deterministic Kerr black hole frame headlessly to PNG.
     Render {
         #[command(flatten)]
         scene: SceneArgs,
@@ -167,7 +311,7 @@ enum Command {
         #[arg(short, long, default_value = "render.png")]
         output: PathBuf,
     },
-    /// Run the headless GPU benchmark gate across 720p, 1440p, and 4K.
+    /// Run the headless Kerr black hole GPU benchmark gate across 720p, 1440p, and 4K.
     Bench {
         #[command(flatten)]
         scene: SceneArgs,
@@ -175,7 +319,7 @@ enum Command {
         #[arg(long, default_value_t = 9)]
         iters: usize,
     },
-    /// Run cross-formulation GPU vs CPU f64 oracle accuracy verification across views.
+    /// Run cross-formulation Kerr GPU vs CPU f64 oracle accuracy verification across views.
     Verify {
         /// Grid width (default 512 for hardware GPU gate, use 64 for fast lavapipe check).
         #[arg(long, default_value_t = 512)]
@@ -192,6 +336,11 @@ enum Command {
         /// Maximum RK4 steps per ray.
         #[arg(long, default_value_t = 2048)]
         max_steps: u32,
+    },
+    /// Forward spectral photon simulator (dispersive optics & relativistic Kerr wavefronts).
+    Photons {
+        #[command(subcommand)]
+        command: PhotonCommand,
     },
 }
 
@@ -231,6 +380,31 @@ fn print_telemetry(label: &str, t: &FrameTelemetry) {
     );
 }
 
+fn print_photon_telemetry(label: &str, t: &PhotonTelemetry) {
+    let p1 = t
+        .pass1_step_ms
+        .map(|v| format!("{v:.2} ms"))
+        .unwrap_or_else(|| "n/a".into());
+    let p2 = t
+        .pass2_resolve_ms
+        .map(|v| format!("{v:.2} ms"))
+        .unwrap_or_else(|| "n/a".into());
+    let p3 = t
+        .pass3_agx_ms
+        .map(|v| format!("{v:.2} ms"))
+        .unwrap_or_else(|| "n/a".into());
+    println!(
+        "{label} ({}x{}, {:.2}M photons x{} substeps): Step={p1}, Resolve={p2}, AgX={p3}, wall={:.2} ms, {:.2} B photon-steps/s | frames={}",
+        t.width,
+        t.height,
+        f64::from(t.num_photons) * 1e-6,
+        t.substeps,
+        t.wall_ms,
+        t.photon_steps_per_sec * 1e-9,
+        t.accum_frames,
+    );
+}
+
 fn angle_wrap(a: f64, b: f64) -> f64 {
     (a - b + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
 }
@@ -253,7 +427,6 @@ fn run_verify_view(
     let h = height as usize;
     let total = w * h;
 
-    // Parallelize CPU f64 oracle across hardware threads using std::thread::scope!
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -536,5 +709,68 @@ fn main() -> Result<()> {
             println!("ALL VERIFICATION GATES PASSED.");
             Ok(())
         }
+        Command::Photons { command } => match command {
+            PhotonCommand::View {
+                args,
+                width,
+                height,
+            } => {
+                let (scene, settings) = args.to_parts();
+                run_photon_viewer(scene, settings, width, height, cli.software)
+            }
+            PhotonCommand::Render {
+                args,
+                width,
+                height,
+                frames,
+                output,
+            } => {
+                let (scene, settings) = args.to_parts();
+                let gpu = GpuContext::new_headless(cli.software)?;
+                let mut pipeline = PhotonPipeline::new(
+                    &gpu,
+                    width,
+                    height,
+                    settings.num_photons,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                );
+                let (rgba, tel) = pipeline.render_headless(&gpu, &scene, &settings, frames)?;
+                write_rgba8_png(&output, width, height, &rgba)
+                    .with_context(|| format!("write PNG to {}", output.display()))?;
+                println!(
+                    "Adapter: {} ({:?})",
+                    gpu.adapter_info.name, gpu.adapter_info.device_type
+                );
+                print_photon_telemetry(scene.id.name(), &tel);
+                println!("Saved {}", output.display());
+                Ok(())
+            }
+            PhotonCommand::Bench {
+                args,
+                width,
+                height,
+                iters,
+            } => {
+                let (scene, settings) = args.to_parts();
+                let gpu = GpuContext::new_headless(cli.software)?;
+                println!(
+                    "Adapter: {} ({:?}), scene={}, mode={:?}",
+                    gpu.adapter_info.name,
+                    gpu.adapter_info.device_type,
+                    scene.id.name(),
+                    settings.mode
+                );
+                let mut pipeline = PhotonPipeline::new(
+                    &gpu,
+                    width,
+                    height,
+                    settings.num_photons,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                );
+                let tel = pipeline.benchmark(&gpu, &scene, &settings, 5, iters)?;
+                print_photon_telemetry(scene.id.name(), &tel);
+                Ok(())
+            }
+        },
     }
 }

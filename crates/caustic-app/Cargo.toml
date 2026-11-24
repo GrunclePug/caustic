@@ -1,0 +1,27 @@
+[package]
+name = "caustic-app"
+description = "CLI and interactive viewer for caustic GPU physics simulations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "caustic"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+caustic-blackhole.workspace = true
+caustic-core.workspace = true
+caustic-photons.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+log.workspace = true
+wgpu.workspace = true
+winit.workspace = true

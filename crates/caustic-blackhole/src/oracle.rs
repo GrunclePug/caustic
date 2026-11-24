@@ -9,7 +9,7 @@
 
 use glam::DVec3;
 
-use super::kerr::{
+use crate::kerr::{
     BlInitialRay, Camera, KerrParams, bl_velocity_to_outgoing_ks_dir, delta_factored,
     disk_redshift_g, outgoing_ks_phi_twist, r_isco, r_plus,
 };

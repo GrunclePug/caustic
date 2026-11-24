@@ -1,6 +1,6 @@
 include config.mk
 
-.PHONY: all build run test fmt lint clean sweep install uninstall bench render
+.PHONY: all build run test fmt lint clean sweep install uninstall bench photons-bench render
 
 all: build
 
@@ -23,6 +23,10 @@ lint: sweep
 # Run the headless GPU benchmark gate on the active Vulkan adapter.
 bench: sweep
 	$(CARGO) run --release -- bench $(ARGS)
+
+# Run the headless forward photon benchmark on the active Vulkan adapter.
+photons-bench: sweep
+	$(CARGO) run --release -- photons bench $(ARGS)
 
 # Render a headless Kerr black hole PNG.
 render: sweep

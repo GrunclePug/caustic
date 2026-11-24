@@ -12,15 +12,15 @@ use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::engine::gpu::{GpuContext, GpuTimers};
-use crate::engine::post::{DebugView, PostUniforms, readback_rgba8_texture};
+use caustic_core::gpu::{GpuContext, GpuTimers};
+use caustic_core::post::{DebugView, PostUniforms, readback_rgba8_texture};
 
-use super::disk::{
+use crate::disk::{
     BLACKBODY_LUT_LEN, BLACKBODY_T_MAX, BLACKBODY_T_MIN, BlackbodyLut, DISK_LUT_LEN,
     build_disk_temp_lut,
 };
-use super::kerr::{Camera, KerrParams};
-use super::oracle::RayStatus;
+use crate::kerr::{Camera, KerrParams};
+use crate::oracle::RayStatus;
 
 /// Matches `struct TraceUniforms` in `src/shaders/kerr_trace.wgsl`.
 #[repr(C)]
@@ -227,25 +227,19 @@ impl BlackHolePipeline {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("kerr_trace.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../../shaders/kerr_trace.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/kerr_trace.wgsl").into()),
             });
         let shade_shader = gpu
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("kerr_shade.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../../shaders/kerr_shade.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/kerr_shade.wgsl").into()),
             });
         let post_shader = gpu
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("post_agx.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../../shaders/post_agx.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/post_agx.wgsl").into()),
             });
 
         let trace_bgl = gpu

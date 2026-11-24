@@ -4,10 +4,10 @@
 //! machine without a discrete GPU, and includes an explicit hardware GPU gate (`512x512` at
 //! `a = +/-0.998`) executed during verification.
 
-use caustic::engine::gpu::GpuContext;
-use caustic::sim::blackhole::gpu_tracer::{BlackHolePipeline, RenderSettings};
-use caustic::sim::blackhole::kerr::{Camera, KerrParams, r_isco};
-use caustic::sim::blackhole::oracle::{RayStatus, trace_oracle_pixel};
+use caustic_blackhole::gpu_tracer::{BlackHolePipeline, RenderSettings};
+use caustic_blackhole::kerr::{Camera, KerrParams, r_isco};
+use caustic_blackhole::oracle::{RayStatus, trace_oracle_pixel};
+use caustic_core::gpu::GpuContext;
 use glam::DVec3;
 
 fn angle_wrap(a: f64, b: f64) -> f64 {

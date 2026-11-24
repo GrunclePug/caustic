@@ -277,19 +277,53 @@ dependencies = [
 ]
 
 [[package]]
-name = "caustic"
-version = "0.1.0"
+name = "caustic-app"
+version = "0.2.0"
 dependencies = [
  "anyhow",
- "bytemuck",
+ "caustic-blackhole",
+ "caustic-core",
+ "caustic-photons",
  "clap",
  "env_logger",
  "glam",
  "log",
- "png",
- "tempfile",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "caustic-blackhole"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "caustic-core",
+ "glam",
+ "wgpu",
+]
+
+[[package]]
+name = "caustic-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "log",
+ "png",
+ "wgpu",
+]
+
+[[package]]
+name = "caustic-photons"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "caustic-blackhole",
+ "caustic-core",
+ "glam",
+ "wgpu",
 ]
 
 [[package]]
@@ -541,12 +575,6 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "fastrand"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fdeflate"
@@ -1827,19 +1855,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "tempfile"
-version = "3.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
-dependencies = [
- "fastrand",
- "getrandom",
- "once_cell",
- "rustix 1.1.6",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
