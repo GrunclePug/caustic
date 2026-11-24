@@ -1,10 +1,12 @@
-// Pass 1: Real-time forward spectral photon simulation in 2D dispersive optics
-// OR equatorial Ingoing Cartesian Kerr-Schild curved spacetime.
+// Pass 1: Real-time forward spectral photon simulation supporting:
+// - PHYS_OPTICS (0): 2D flat-space dispersive optics (prisms, lenses, mirrors, absorbers)
+// - PHYS_KERR (1): Equatorial Ingoing Cartesian Kerr-Schild curved spacetime
+// - PHYS_GRIN_LUNEBURG (2): Analytical Luneburg GRIN sphere n^2 = 1 + c*(1 - r^2/R^2)
+// - PHYS_GRIN_BH (3): Smooth chromatic inverse-square optical black hole n^2 = 1 + (b_c/r)^2
+// - PHYS_GRIN_MIRAGE (4): Exponential thermal atmospheric mirage above hot ground
 //
-// Struct layouts match `crates/caustic-photons/src/scene.rs` and `gpu_sim.rs`.
-// Deposits CIE 1931 XYZ (strictly non-negative for all wavelengths) into a fixed-point
-// atomic<u32> accumulation buffer so arbitrary wavelengths mix physically into white
-// without requiring f32 atomics.
+// Deposits strictly non-negative CIE 1931 XYZ into a fixed-point atomic<u32> buffer with
+// unbiased stochastic strided arc-length splatting for high-FPS live editing and convergence.
 
 struct SimUniforms {
     // xy = view_center, z = view_half_height, w = aspect (width / height)
@@ -13,26 +15,27 @@ struct SimUniforms {
     emitter: vec4<f32>,
     // x = dt_substep, y = spin a, z = r_plus, w = fixed_scale
     physics: vec4<f32>,
-    // x = width, y = height, z = num_photons, w = substeps
+    // x = splat_stride, y = grin_strength, z = dispersion_scale, w = reserved
+    extra: vec4<f32>,
+    // x = width, y = height, z = active_photons, w = substeps
     dims: vec4<u32>,
-    // x = is_kerr (0/1), y = mode (0=Accumulate, 1=Pulse), z = emitter_kind (0=Beam, 1=Point), w = pulse_trigger (0/1)
+    // x = physics_kind, y = mode (0=Accumulate, 1=Pulse), z = emitter_kind, w = pulse_trigger
     flags: vec4<u32>,
     // x = num_segments, y = num_circles, z = frame_idx, w = seed
     counts: vec4<u32>,
 };
 
-// 32-byte Photon state record.
+// 32-byte Photon state record (used persistently in MODE_PULSE).
 struct Photon {
     pos: vec2<f32>,
-    // In optics mode: unit direction d. In Kerr mode: covariant spatial momentum (p_x, p_y).
+    // Optics: unit direction d. Kerr: covariant spatial momentum (p_x, p_y). GRIN: eikonal p (|p| = n).
     p: vec2<f32>,
-    // In optics mode: wavelength in nm [380..780].
-    // In Kerr mode: emitted local ZAMO wavelength lambda_emit (with nu_emit = 1.0).
+    // Optics & GRIN: wavelength in nm [380..780]. Kerr: emitted local ZAMO wavelength (nu_emit = 1).
     lambda_nm: f32,
-    // In optics mode: 1.0 (or current medium IOR n_cur). In Kerr mode: conserved energy E = -p_t.
+    // Optics: current medium IOR n_cur. Kerr: conserved energy E = -p_t. GRIN: 1.0.
     energy: f32,
     rng: u32,
-    // bit 0: active, bit 1: inside_glass, bits 2..32: bounces/age
+    // bit 0: active, bits 2..32: bounces/age
     flags: u32,
 };
 
@@ -56,18 +59,35 @@ struct OptCircle {
 @group(0) @binding(4) var<storage, read> segments: array<OptSegment>;
 @group(0) @binding(5) var<storage, read> circles: array<OptCircle>;
 
+const PHYS_OPTICS: u32 = 0u;
+const PHYS_KERR: u32 = 1u;
+const PHYS_GRIN_LUNEBURG: u32 = 2u;
+const PHYS_GRIN_BH: u32 = 3u;
+const PHYS_GRIN_MIRAGE: u32 = 4u;
+
 const MAT_MIRROR: u32 = 1u;
 const MAT_GLASS: u32 = 2u;
 const MAT_ABSORBER: u32 = 3u;
 
 const EMITTER_BEAM: u32 = 0u;
-const EMITTER_POINT: u32 = 1u;
 
 const MODE_ACCUMULATE: u32 = 0u;
-const MODE_PULSE: u32 = 1u;
 
 const LAMBDA_MIN: f32 = 380.0;
 const LAMBDA_MAX: f32 = 780.0;
+
+// GRIN geometry constants shared with photon_resolve.wgsl and grin.rs.
+const LUNEBURG_R: f32 = 3.2;
+const OPT_BH_BC_BASE: f32 = 2.4;
+const OPT_BH_CORE_R: f32 = 0.72;
+const MIRAGE_Y_GROUND: f32 = -2.2;
+const MIRAGE_SCALE_H: f32 = 1.35;
+
+fn hash_u32(x: u32) -> u32 {
+    var v = x * 747796405u + 2891336453u;
+    v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (v >> 22u) ^ v;
+}
 
 fn pcg_next(state: ptr<function, u32>) -> u32 {
     let old = *state;
@@ -127,9 +147,9 @@ fn splat_pixel_xyz(ix: i32, iy: i32, xyz: vec3<f32>) {
     }
 }
 
-// Liang-Barsky screen-clipped, step-size-invariant spectral segment splat.
-// Every pixel crossed receives exact geometric arc-length weighting (step_px * density_w)
-// with stochastic phase jitter along the segment to prevent step-boundary Moire.
+// Liang-Barsky screen-clipped, unbiased stochastic strided spectral segment splat.
+// Stepping by `stride` pixels with random phase `jitter in [0, 1)` and weighting by `step_px`
+// keeps expected irradiance strictly unbiased while slashing L2 atomic contention by ~stride-x.
 fn splat_segment_xyz(w0: vec2<f32>, w1: vec2<f32>, xyz: vec3<f32>, density_w: f32, jitter: f32) {
     let s0 = world_to_pixel(w0);
     let s1 = world_to_pixel(w1);
@@ -140,7 +160,6 @@ fn splat_segment_xyz(w0: vec2<f32>, w1: vec2<f32>, xyz: vec3<f32>, density_w: f3
     var t0 = 0.0;
     var t1 = 1.0;
 
-    // Clip X against [0, fw]
     if (abs(d.x) < 1e-6) {
         if (s0.x < 0.0 || s0.x >= fw) {
             return;
@@ -153,7 +172,6 @@ fn splat_segment_xyz(w0: vec2<f32>, w1: vec2<f32>, xyz: vec3<f32>, density_w: f3
         t1 = min(t1, max(tx0, tx1));
     }
 
-    // Clip Y against [0, fh]
     if (abs(d.y) < 1e-6) {
         if (s0.y < 0.0 || s0.y >= fh) {
             return;
@@ -177,7 +195,8 @@ fn splat_segment_xyz(w0: vec2<f32>, w1: vec2<f32>, xyz: vec3<f32>, density_w: f3
         return;
     }
 
-    let n = clamp(u32(ceil(dist_px)), 1u, 4096u);
+    let stride = max(u.extra.x, 1.0);
+    let n = clamp(u32(ceil(dist_px / stride)), 1u, 2048u);
     let step_px = dist_px / f32(n);
     let per_sample = xyz * (density_w * step_px);
     let step_vec = (c1 - c0) / f32(n);
@@ -186,6 +205,62 @@ fn splat_segment_xyz(w0: vec2<f32>, w1: vec2<f32>, xyz: vec3<f32>, density_w: f3
         splat_pixel_xyz(i32(floor(cur.x)), i32(floor(cur.y)), per_sample);
         cur = cur + step_vec;
     }
+}
+
+// ---------- Continuous Graded-Index (GRIN) Eikonal Optics ----------
+
+struct GrinEval {
+    n2: f32,
+    half_grad_n2: vec2<f32>,
+};
+
+fn grin_chromatic_offset(lambda_nm: f32) -> f32 {
+    let lam_um = clamp(lambda_nm * 1e-3, 0.35, 0.85);
+    return 0.3025 / (lam_um * lam_um) - 1.0;
+}
+
+fn eval_grin(phys: u32, pos: vec2<f32>, lambda_nm: f32) -> GrinEval {
+    let strength = max(u.extra.y, 0.05);
+    let disp = max(u.extra.z, 0.0);
+    let chi = grin_chromatic_offset(lambda_nm);
+
+    if (phys == PHYS_GRIN_LUNEBURG) {
+        let r2 = dot(pos, pos);
+        let big_r2 = LUNEBURG_R * LUNEBURG_R;
+        if (r2 >= big_r2) {
+            return GrinEval(1.0, vec2<f32>(0.0));
+        }
+        let c = max(strength * (1.0 + 0.16 * disp * chi), 0.05);
+        let n2 = 1.0 + c * (1.0 - r2 / big_r2);
+        return GrinEval(n2, -(c / big_r2) * pos);
+    }
+
+    if (phys == PHYS_GRIN_BH) {
+        let bc0 = OPT_BH_BC_BASE * sqrt(strength);
+        let bc = max(bc0 * (1.0 + 0.24 * disp * chi), 0.2);
+        let bc2 = bc * bc;
+        let r2 = max(dot(pos, pos), 1e-6);
+        let n2 = 1.0 + bc2 / r2;
+        return GrinEval(n2, -(bc2 / (r2 * r2)) * pos);
+    }
+
+    // PHYS_GRIN_MIRAGE
+    let n_air = max(1.08 + 0.045 * disp * chi, 1.01);
+    let amp = clamp(0.30 * strength * (1.0 + 0.22 * disp * chi), 0.02, n_air * n_air - 0.25);
+    let dy = max(pos.y - MIRAGE_Y_GROUND, 0.0);
+    let ex = exp(-dy / MIRAGE_SCALE_H);
+    let n2 = n_air * n_air - amp * ex;
+    return GrinEval(n2, vec2<f32>(0.0, (amp / (2.0 * MIRAGE_SCALE_H)) * ex));
+}
+
+fn grin_absorbed(phys: u32, pos: vec2<f32>) -> bool {
+    if (phys == PHYS_GRIN_BH) {
+        return dot(pos, pos) <= OPT_BH_CORE_R * OPT_BH_CORE_R;
+    }
+    if (phys == PHYS_GRIN_MIRAGE) {
+        return pos.y <= MIRAGE_Y_GROUND;
+    }
+    return false;
 }
 
 // ---------- Ingoing Cartesian Kerr-Schild Equatorial (z = 0) Physics ----------
@@ -235,8 +310,6 @@ fn equatorial_zamo_nu(pos: vec2<f32>, p: vec2<f32>, energy: f32, a: f32, a2: f32
     return max((energy - omega * lz) / alpha, 1e-4);
 }
 
-// Initialize a future-directed null covector (E, p) in Ingoing KS at `pos` aiming along `aim`.
-// Normalized to local ZAMO frequency nu_emit = 1.0.
 fn init_kerr_photon_momentum(pos: vec2<f32>, aim: vec2<f32>, a: f32, a2: f32, rp: f32) -> vec3<f32> {
     let r = ks_r(pos, a2);
     let r2 = r * r;
@@ -250,7 +323,6 @@ fn init_kerr_photon_momentum(pos: vec2<f32>, aim: vec2<f32>, a: f32, a2: f32, rp
     let alpha = sqrt(max((r2 * delta) / big_a, 1e-6));
     let omega = (2.0 * a * r) / big_a;
 
-    // Metric dot helper in (t, x, y): g(u, v) = -u.x*v.x + dot(u.yz, v.yz) + 2h*(l.u)*(l.v)
     let e_t = vec3<f32>(1.0, -omega * pos.y, omega * pos.x) / alpha;
 
     let xi_phi = vec3<f32>(0.0, -pos.y, pos.x);
@@ -282,6 +354,16 @@ fn init_kerr_photon_momentum(pos: vec2<f32>, aim: vec2<f32>, a: f32, a2: f32, rp
     return vec3<f32>(-p_t, p_xy.x, p_xy.y);
 }
 
+fn kerr_spectral_xyz(lambda_emit: f32, nu_loc: f32) -> vec4<f32> {
+    let g_vis = pow(clamp(nu_loc, 0.35, 10.0), 0.42);
+    let lam_loc = clamp(lambda_emit / g_vis, 432.0, 675.0);
+    let xyz = 0.5 * sample_spectral_xyz(lam_loc)
+        + 0.25 * sample_spectral_xyz(max(lam_loc - 14.0, 410.0))
+        + 0.25 * sample_spectral_xyz(min(lam_loc + 14.0, 700.0));
+    let energy_boost = clamp(pow(nu_loc, 0.35), 0.65, 2.4);
+    return vec4<f32>(xyz, energy_boost);
+}
+
 // ---------- Flat-Space Optical Intersection Helpers ----------
 
 struct HitInfo {
@@ -295,7 +377,6 @@ struct HitInfo {
 fn intersect_scene(pos: vec2<f32>, dir: vec2<f32>, t_max: f32) -> HitInfo {
     var best = HitInfo(t_max + 1.0, vec2<f32>(0.0, 1.0), 0u, 1.0, 0.0);
 
-    // 1. Line segments (mirrors, prism faces, absorbers)
     let n_seg = u.counts.x;
     for (var i = 0u; i < n_seg; i = i + 1u) {
         let seg = segments[i];
@@ -310,13 +391,11 @@ fn intersect_scene(pos: vec2<f32>, dir: vec2<f32>, t_max: f32) -> HitInfo {
         let t = (ap.x * e.y - ap.y * e.x) / denom;
         let s = (ap.x * dir.y - ap.y * dir.x) / denom;
         if (t > 1e-6 && t < best.t && s >= 0.0 && s <= 1.0) {
-            // Outward normal for CCW polygon edge a -> b is (e.y, -e.x).
             let n = normalize(vec2<f32>(e.y, -e.x));
             best = HitInfo(t, n, seg.info.x, seg.material.x, seg.material.y);
         }
     }
 
-    // 2. Circular arcs and clipped biconvex lens surfaces
     let n_cir = u.counts.y;
     for (var i = 0u; i < n_cir; i = i + 1u) {
         let cir = circles[i];
@@ -366,8 +445,7 @@ fn intersect_scene(pos: vec2<f32>, dir: vec2<f32>, t_max: f32) -> HitInfo {
 fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
     let base_ang = u.emitter.z;
     let spread = u.emitter.w;
-    let is_kerr = u.flags.x != 0u;
-    let mode = u.flags.y;
+    let phys = u.flags.x;
     let emitter_kind = u.flags.z;
 
     let r0 = rand_f32(rng);
@@ -378,7 +456,6 @@ fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
 
     if (emitter_kind == EMITTER_BEAM) {
         let perp = vec2<f32>(-aim.y, aim.x);
-        // Stratified across photon id for low-noise live dragging AND smooth pulse wavefronts!
         let lane = ((f32(gid) + r0) / f32(u.dims.z)) * 2.0 - 1.0;
         pos = pos + perp * (lane * spread);
     } else {
@@ -387,38 +464,48 @@ fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
         aim = vec2<f32>(cos(ang), sin(ang));
     }
 
-    if (is_kerr) {
+    if (phys == PHYS_KERR) {
         let a = u.physics.y;
         let a2 = a * a;
         let rp = u.physics.z;
-        // Keep spawn safely outside horizon.
         if (ks_r(pos, a2) <= rp * 1.15) {
             pos = normalize(pos + vec2<f32>(1e-4, 0.0)) * (rp * 1.3 + abs(a));
         }
         let ep = init_kerr_photon_momentum(pos, aim, a, a2, rp);
         let energy = ep.x;
         let p = ep.yz;
-        // Warm golden-amber emission band (585..610 nm, nu_emit = 1.0) so gravitational
-        // blueshift shifts smoothly gold -> emerald -> cyan -> electric violet while
-        // gravitational redshift shifts gold -> orange -> deep crimson.
         let lambda_emit = mix(585.0, 610.0, r1);
         return Photon(pos, p, lambda_emit, energy, *rng, 1u);
-    } else {
-        // Uniform full visible spectrum [380, 780] nm -> integrates to pure white light,
-        // splits into full physical rainbow inside Cauchy dispersive glass!
-        let lambda_nm = mix(LAMBDA_MIN, LAMBDA_MAX, r1);
-        return Photon(pos, aim, lambda_nm, 1.0, *rng, 1u);
     }
+
+    let lambda_nm = mix(LAMBDA_MIN, LAMBDA_MAX, r1);
+    if (phys >= PHYS_GRIN_LUNEBURG) {
+        if (phys == PHYS_GRIN_BH && length(pos) <= OPT_BH_CORE_R * 1.15) {
+            pos = normalize(pos + vec2<f32>(1e-4, 0.0)) * (OPT_BH_CORE_R * 1.35);
+        }
+        if (phys == PHYS_GRIN_MIRAGE && pos.y <= MIRAGE_Y_GROUND + 0.05) {
+            pos.y = MIRAGE_Y_GROUND + 0.08;
+        }
+        let ge = eval_grin(phys, pos, lambda_nm);
+        let p = aim * sqrt(max(ge.n2, 0.1));
+        return Photon(pos, p, lambda_nm, 1.0, *rng, 1u);
+    }
+
+    return Photon(pos, aim, lambda_nm, 1.0, *rng, 1u);
 }
 
-fn kerr_spectral_xyz(lambda_emit: f32, nu_loc: f32) -> vec4<f32> {
-    let g_vis = pow(clamp(nu_loc, 0.35, 10.0), 0.42);
-    let lam_loc = clamp(lambda_emit / g_vis, 432.0, 675.0);
-    let xyz = 0.5 * sample_spectral_xyz(lam_loc)
-        + 0.25 * sample_spectral_xyz(max(lam_loc - 14.0, 410.0))
-        + 0.25 * sample_spectral_xyz(min(lam_loc + 14.0, 700.0));
-    let energy_boost = clamp(pow(nu_loc, 0.35), 0.65, 2.4);
-    return vec4<f32>(xyz, energy_boost);
+fn grin_rk4_step(phys: u32, pos0: vec2<f32>, p0: vec2<f32>, lambda_nm: f32, h: f32) -> vec4<f32> {
+    let g1 = eval_grin(phys, pos0, lambda_nm).half_grad_n2;
+    let p2 = p0 + 0.5 * h * g1;
+    let g2 = eval_grin(phys, pos0 + 0.5 * h * p0, lambda_nm).half_grad_n2;
+    let p3 = p0 + 0.5 * h * g2;
+    let g3 = eval_grin(phys, pos0 + 0.5 * h * p2, lambda_nm).half_grad_n2;
+    let p4 = p0 + h * g3;
+    let g4 = eval_grin(phys, pos0 + h * p3, lambda_nm).half_grad_n2;
+
+    let pos1 = pos0 + (h / 6.0) * (p0 + 2.0 * p2 + 2.0 * p3 + p4);
+    let p1 = p0 + (h / 6.0) * (g1 + 2.0 * g2 + 2.0 * g3 + g4);
+    return vec4<f32>(pos1.x, pos1.y, p1.x, p1.y);
 }
 
 @compute @workgroup_size(256, 1, 1)
@@ -428,29 +515,23 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
         return;
     }
 
-    let is_kerr = u.flags.x != 0u;
+    let phys = u.flags.x;
     let mode = u.flags.y;
     let pulse_trigger = u.flags.w != 0u;
     let substeps = u.dims.w;
     let dt_step = u.physics.x;
 
-    // World bounds with generous margin so curved or reflected paths return cleanly.
     let half_h = u.view.z;
     let half_w = half_h * u.view.w;
     let bound_x = half_w * 2.4;
     let bound_y = half_h * 2.4;
 
     if (mode == MODE_ACCUMULATE) {
-        // Full-path forward photon tracing per frame: every frame delivers complete
-        // end-to-end trajectories so live emitter dragging and aiming update the entire
-        // beam, dispersion rainbow, and caustics instantaneously at interactive framerates,
-        // while stationary frames accumulate cleanly to multi-million-photon HDR quality!
-        var rng = gid * 1973u + u.counts.w * 9277u + u.counts.z * 26699u + 1u;
+        var rng = hash_u32(gid ^ hash_u32(u.counts.z * 0x9E3779B9u ^ hash_u32(u.counts.w)));
         let _w0 = pcg_next(&rng);
-        let _w1 = pcg_next(&rng);
         var ph = spawn_photon(gid, &rng);
 
-        if (is_kerr) {
+        if (phys == PHYS_KERR) {
             let a = u.physics.y;
             let a2 = a * a;
             let rp = u.physics.z;
@@ -470,8 +551,7 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
 
                 let pos1 = pos0 + (h / 6.0) * (k1.dx + 2.0 * k2.dx + 2.0 * k3.dx + k4.dx);
                 let p1 = p0 + (h / 6.0) * (k1.dp + 2.0 * k2.dp + 2.0 * k3.dp + k4.dp);
-                let r_next = ks_r(pos1, a2);
-                if (r_next <= r_cap) {
+                if (ks_r(pos1, a2) <= r_cap) {
                     break;
                 }
 
@@ -486,8 +566,43 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                     break;
                 }
             }
+        } else if (phys >= PHYS_GRIN_LUNEBURG) {
+            let xyz = sample_spectral_xyz(ph.lambda_nm);
+            // Randomize RK4 step phase slightly per photon to eliminate discrete boundary aliasing
+            // at the Luneburg sphere rim (where grad(n^2) turns on linearly).
+            let h_jit = mix(0.82, 1.18, rand_f32(&rng));
+            for (var step = 0u; step < 440u; step = step + 1u) {
+                let pos0 = ph.pos;
+                let p0 = ph.p;
+                let ge = eval_grin(phys, pos0, ph.lambda_nm);
+                let n_cur = sqrt(max(ge.n2, 0.1));
+                var h = 0.06;
+                if (phys == PHYS_GRIN_LUNEBURG) {
+                    h = select(0.14, 0.025, length(pos0) < LUNEBURG_R * 1.12) * h_jit;
+                } else if (phys == PHYS_GRIN_BH) {
+                    h = clamp(0.028 * length(pos0) / n_cur, 0.004, 0.16);
+                } else {
+                    h = 0.07;
+                }
+
+                let next = grin_rk4_step(phys, pos0, p0, ph.lambda_nm, h);
+                let pos1 = next.xy;
+                let p1 = next.zw;
+                if (grin_absorbed(phys, pos1)) {
+                    splat_segment_xyz(pos0, pos1, xyz, 1.0, rand_f32(&rng));
+                    break;
+                }
+
+                splat_segment_xyz(pos0, pos1, xyz, 1.0, rand_f32(&rng));
+                ph.pos = pos1;
+                ph.p = p1;
+                let rel = abs(pos1 - u.view.xy);
+                if (rel.x > bound_x || rel.y > bound_y) {
+                    break;
+                }
+            }
         } else {
-            // Exact straight-line multi-bounce dispersive optics in one frame.
+            // PHYS_OPTICS: exact straight-line multi-bounce dispersive optics.
             let xyz = sample_spectral_xyz(ph.lambda_nm);
             let max_dist = length(vec2<f32>(bound_x, bound_y)) * 2.5;
 
@@ -553,7 +668,7 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
     var ph = photons[gid];
     var rng = ph.rng;
     if (u.counts.z == 0u || pulse_trigger) {
-        rng = gid * 1973u + u.counts.w * 9277u + u.counts.z * 26699u + 1u;
+        rng = hash_u32(gid ^ hash_u32(u.counts.z * 0x9E3779B9u ^ hash_u32(u.counts.w)));
         let _w = pcg_next(&rng);
         ph = spawn_photon(gid, &rng);
     }
@@ -564,7 +679,7 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
         return;
     }
 
-    if (is_kerr) {
+    if (phys == PHYS_KERR) {
         let a = u.physics.y;
         let a2 = a * a;
         let rp = u.physics.z;
@@ -574,14 +689,12 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
             if ((ph.flags & 1u) == 0u) {
                 break;
             }
-
             let pos0 = ph.pos;
             let p0 = ph.p;
             let energy = ph.energy;
             let r_cur = ks_r(pos0, a2);
 
             let k1 = ingoing_ks_rhs(pos0, p0, energy, a, a2);
-            // Step by coordinate time dt so real Shapiro delay wraps the wavefront near r_+.
             let dt_dl = clamp(k1.dt, 0.25, 16.0);
             let h = min(dt_step / dt_dl, clamp(0.025 * r_cur, 0.01, dt_step));
 
@@ -591,9 +704,7 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
 
             let pos1 = pos0 + (h / 6.0) * (k1.dx + 2.0 * k2.dx + 2.0 * k3.dx + k4.dx);
             let p1 = p0 + (h / 6.0) * (k1.dp + 2.0 * k2.dp + 2.0 * k3.dp + k4.dp);
-            let r_next = ks_r(pos1, a2);
-
-            if (r_next <= r_cap) {
+            if (ks_r(pos1, a2) <= r_cap) {
                 ph.flags = ph.flags & (~1u);
                 break;
             }
@@ -612,12 +723,45 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                 ph.flags = (ph.flags & 3u) | (age << 2u);
             }
         }
+    } else if (phys >= PHYS_GRIN_LUNEBURG) {
+        let xyz = sample_spectral_xyz(ph.lambda_nm);
+        for (var s = 0u; s < substeps; s = s + 1u) {
+            if ((ph.flags & 1u) == 0u) {
+                break;
+            }
+            let pos0 = ph.pos;
+            let p0 = ph.p;
+            let ge = eval_grin(phys, pos0, ph.lambda_nm);
+            // Physical coordinate time dt = n^2 * dtau -> exact c / n(x, lambda) wavefront slowing!
+            let h_time = dt_step / max(ge.n2, 0.25);
+            let h_safe = select(0.08, clamp(0.03 * length(pos0) / sqrt(max(ge.n2, 0.25)), 0.004, 0.08), phys == PHYS_GRIN_BH);
+            let h = min(h_time, h_safe);
+
+            let next = grin_rk4_step(phys, pos0, p0, ph.lambda_nm, h);
+            let pos1 = next.xy;
+            let p1 = next.zw;
+            if (grin_absorbed(phys, pos1)) {
+                splat_segment_xyz(pos0, pos1, xyz, 1.0, rand_f32(&rng));
+                ph.flags = ph.flags & (~1u);
+                break;
+            }
+
+            splat_segment_xyz(pos0, pos1, xyz, 1.0, rand_f32(&rng));
+            ph.pos = pos1;
+            ph.p = p1;
+            let age = (ph.flags >> 2u) + 1u;
+            let rel = abs(pos1 - u.view.xy);
+            if (rel.x > bound_x || rel.y > bound_y || age > 4000u) {
+                ph.flags = ph.flags & (~1u);
+            } else {
+                ph.flags = (ph.flags & 3u) | (age << 2u);
+            }
+        }
     } else {
         for (var s = 0u; s < substeps; s = s + 1u) {
             if ((ph.flags & 1u) == 0u) {
                 break;
             }
-
             let xyz = sample_spectral_xyz(ph.lambda_nm);
             var rem_t = dt_step;
             for (var bounce_iter = 0u; bounce_iter < 4u; bounce_iter = bounce_iter + 1u) {

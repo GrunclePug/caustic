@@ -1,15 +1,15 @@
 // Pass 2: Resolve fixed-point atomic<u32> spectral CIE XYZ buffer into linear Rec.709 HDR,
 // clear atomic deposits for the next frame, apply accumulation or pulse persistence decay,
-// and draw subtle optical element / Kerr horizon-ergosphere guides.
+// and draw subtle optical element, GRIN medium, or Kerr horizon-ergosphere guides.
 
 struct ResolveUniforms {
     // xy = view_center, z = view_half_height, w = aspect
     view: vec4<f32>,
     // x = inv_fixed_scale, y = decay (Pulse mode), z = exposure_gain, w = accum_norm (1 / accum_frames)
     params: vec4<f32>,
-    // x = spin a, y = r_plus, z = r_ph_pro, w = r_ph_ret
+    // x = spin a, y = r_plus, z = grin_strength, w = dispersion_scale
     kerr: vec4<f32>,
-    // x = width, y = height, z = is_kerr, w = mode (0=Accumulate, 1=Pulse)
+    // x = width, y = height, z = physics_kind, w = mode (0=Accumulate, 1=Pulse)
     dims: vec4<u32>,
     // x = num_segments, y = num_circles, z = clear_hdr (0/1), w = reserved
     counts: vec4<u32>,
@@ -35,8 +35,20 @@ struct OptCircle {
 @group(0) @binding(4) var<storage, read> segments: array<OptSegment>;
 @group(0) @binding(5) var<storage, read> circles: array<OptCircle>;
 
+const PHYS_OPTICS: u32 = 0u;
+const PHYS_KERR: u32 = 1u;
+const PHYS_GRIN_LUNEBURG: u32 = 2u;
+const PHYS_GRIN_BH: u32 = 3u;
+const PHYS_GRIN_MIRAGE: u32 = 4u;
+
 const MAT_MIRROR: u32 = 1u;
-const MAT_GLASS: u32 = 2u;
+const MAT_ABSORBER: u32 = 3u;
+
+const LUNEBURG_R: f32 = 3.2;
+const OPT_BH_BC_BASE: f32 = 2.4;
+const OPT_BH_CORE_R: f32 = 0.72;
+const MIRAGE_Y_GROUND: f32 = -2.2;
+const MIRAGE_SCALE_H: f32 = 1.35;
 
 fn xyz_to_rec709(xyz: vec3<f32>) -> vec3<f32> {
     let rgb = vec3<f32>(
@@ -47,8 +59,6 @@ fn xyz_to_rec709(xyz: vec3<f32>) -> vec3<f32> {
     let min_c = min(rgb.r, min(rgb.g, rgb.b));
     if (min_c < 0.0) {
         let max_c = max(rgb.r, max(rgb.g, rgb.b));
-        // Keep pure spectral violet/blue luminous instead of collapsing toward tiny CIE Y,
-        // while leaving in-gamut / white light untouched.
         let pivot = max(max(xyz.y, 0.0), max_c * 0.14);
         let alpha = pivot / max(pivot - min_c, 1e-6);
         return max(mix(vec3<f32>(pivot), rgb, clamp(alpha, 0.0, 1.0)), vec3<f32>(0.0));
@@ -65,28 +75,61 @@ fn dist_to_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 fn scene_overlay(world: vec2<f32>, px_world: f32) -> vec3<f32> {
     var col = vec3<f32>(0.0);
     let line_w = px_world * 1.4;
+    let phys = u.dims.z;
 
-    if (u.dims.z != 0u) {
-        // Kerr spacetime guides: solid black horizon r_+, subtle blue ergosphere (r=2M),
-        // faint dashed-look photon orbit rings.
+    if (phys == PHYS_KERR) {
         let a = u.kerr.x;
         let rp = u.kerr.y;
         let r = sqrt(max(dot(world, world) - a * a, 0.0));
-        // Event horizon rim glow
         let d_hor = abs(r - rp);
         col = col + vec3<f32>(0.18, 0.22, 0.32) * exp(-(d_hor * d_hor) / (line_w * line_w * 2.0));
-        // Ergosphere boundary (r = 2M on equatorial plane)
         let d_ergo = abs(r - 2.0);
         col = col + vec3<f32>(0.04, 0.09, 0.16) * exp(-(d_ergo * d_ergo) / (line_w * line_w * 1.5));
         return col;
     }
 
-    // Subtle wireframe outline of glass prisms, lenses, and mirrors.
+    if (phys == PHYS_GRIN_LUNEBURG) {
+        let r = length(world);
+        let d_rim = abs(r - LUNEBURG_R);
+        col = col + vec3<f32>(0.10, 0.20, 0.30) * exp(-(d_rim * d_rim) / (line_w * line_w * 1.4));
+        if (r < LUNEBURG_R) {
+            let grad_vis = (1.0 - (r * r) / (LUNEBURG_R * LUNEBURG_R));
+            col = col + vec3<f32>(0.008, 0.018, 0.032) * grad_vis;
+        }
+        return col;
+    }
+
+    if (phys == PHYS_GRIN_BH) {
+        let r = length(world);
+        let d_core = abs(r - OPT_BH_CORE_R);
+        col = col + vec3<f32>(0.22, 0.26, 0.36) * exp(-(d_core * d_core) / (line_w * line_w * 1.8));
+        let bc = OPT_BH_BC_BASE * sqrt(max(u.kerr.z, 0.05));
+        let d_ph = abs(r - bc);
+        col = col + vec3<f32>(0.05, 0.09, 0.14) * exp(-(d_ph * d_ph) / (line_w * line_w * 1.4));
+        return col;
+    }
+
+    if (phys == PHYS_GRIN_MIRAGE) {
+        let d_gnd = abs(world.y - MIRAGE_Y_GROUND);
+        col = col + vec3<f32>(0.28, 0.14, 0.06) * exp(-(d_gnd * d_gnd) / (line_w * line_w * 1.8));
+        if (world.y > MIRAGE_Y_GROUND) {
+            let heat = exp(-(world.y - MIRAGE_Y_GROUND) / MIRAGE_SCALE_H);
+            col = col + vec3<f32>(0.025, 0.008, 0.002) * heat;
+        }
+        return col;
+    }
+
+    // PHYS_OPTICS wireframe guides for glass, mirrors, and beam stops.
     for (var i = 0u; i < u.counts.x; i = i + 1u) {
         let seg = segments[i];
         let d = dist_to_segment(world, seg.endpoints.xy, seg.endpoints.zw);
         let alpha = exp(-(d * d) / (line_w * line_w));
-        let tint = select(vec3<f32>(0.08, 0.16, 0.24), vec3<f32>(0.25, 0.28, 0.34), seg.info.x == MAT_MIRROR);
+        var tint = vec3<f32>(0.08, 0.16, 0.24);
+        if (seg.info.x == MAT_MIRROR) {
+            tint = vec3<f32>(0.25, 0.28, 0.34);
+        } else if (seg.info.x == MAT_ABSORBER) {
+            tint = vec3<f32>(0.34, 0.12, 0.10);
+        }
         col = col + tint * alpha;
     }
 
@@ -137,7 +180,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rx = f32(accum_xyz[base]) * u.params.x;
     let ry = f32(accum_xyz[base + 1u]) * u.params.x;
     let rz = f32(accum_xyz[base + 2u]) * u.params.x;
-    // Clear atomic deposit buffer in place for the next simulation frame!
     accum_xyz[base] = 0u;
     accum_xyz[base + 1u] = 0u;
     accum_xyz[base + 2u] = 0u;
@@ -147,30 +189,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (u.counts.z != 0u) {
         acc_xyz = frame_xyz;
     } else if (u.dims.w == 0u) {
-        // Long-exposure accumulation mode: sum spectral XYZ linearly across frames!
         acc_xyz = acc_xyz + frame_xyz;
     } else {
-        // Live pulse flight mode: exponential persistence trail decay.
         acc_xyz = acc_xyz * u.params.y + frame_xyz;
     }
     hdr_accum[idx] = vec4<f32>(acc_xyz, 1.0);
 
-    // Convert accumulated CIE XYZ -> linear Rec.709 RGB AFTER spectral summation!
     let scale = select(u.params.z, u.params.z * u.params.w, u.dims.w == 0u);
     var rgb = xyz_to_rec709(acc_xyz * scale);
 
-    // Subtle physical object guides + solid event horizon interior mask in Kerr mode.
     let half_h = u.view.z;
     let half_w = half_h * u.view.w;
     let uv = (vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5)) / vec2<f32>(f32(width), f32(height));
     let world = u.view.xy + vec2<f32>((uv.x * 2.0 - 1.0) * half_w, (1.0 - uv.y * 2.0) * half_h);
     let px_world = (2.0 * half_h) / f32(height);
 
-    if (u.dims.z != 0u) {
+    let phys = u.dims.z;
+    if (phys == PHYS_KERR) {
         let a = u.kerr.x;
         let rp = u.kerr.y;
         let r = sqrt(max(dot(world, world) - a * a, 0.0));
         if (r < rp) {
+            rgb = vec3<f32>(0.0);
+        }
+    } else if (phys == PHYS_GRIN_BH) {
+        if (dot(world, world) < OPT_BH_CORE_R * OPT_BH_CORE_R) {
+            rgb = vec3<f32>(0.0);
+        }
+    } else if (phys == PHYS_GRIN_MIRAGE) {
+        if (world.y < MIRAGE_Y_GROUND) {
             rgb = vec3<f32>(0.0);
         }
     }

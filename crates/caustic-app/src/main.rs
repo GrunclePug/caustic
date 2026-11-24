@@ -1,8 +1,7 @@
-//! Caustic CLI: general-relativistic Kerr black hole tracer and real-time forward
-//! spectral photon simulator.
+//! Caustic CLI and unified interactive studio: general-relativistic Kerr black hole
+//! tracer and real-time forward spectral photon / GRIN optics simulator.
 
-mod blackhole_viewer;
-mod photon_viewer;
+mod studio;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -21,14 +20,13 @@ use caustic_core::post::{DebugView, write_rgba8_png};
 use caustic_photons::gpu_sim::{PhotonPipeline, PhotonSettings, PhotonTelemetry};
 use caustic_photons::scene::{PhotonMode, PhotonScene, PhotonSceneId};
 
-use crate::blackhole_viewer::run_viewer;
-use crate::photon_viewer::run_photon_viewer;
+use crate::studio::{StudioConfig, StudioMode, run_studio};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "caustic",
     version,
-    about = "GPU-accelerated general-relativistic Kerr black hole and spectral photon simulator"
+    about = "GPU-accelerated general-relativistic Kerr black hole, GRIN optics, and spectral photon simulator"
 )]
 struct Cli {
     /// Force software Vulkan adapter (lavapipe) instead of hardware GPU.
@@ -36,7 +34,7 @@ struct Cli {
     software: bool,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -63,6 +61,9 @@ enum PhotonSceneArg {
     Prism,
     Cardioid,
     Lens,
+    Luneburg,
+    OpticalBh,
+    Mirage,
     KerrBeam,
     KerrPulsar,
 }
@@ -73,6 +74,9 @@ impl From<PhotonSceneArg> for PhotonSceneId {
             PhotonSceneArg::Prism => Self::Prism,
             PhotonSceneArg::Cardioid => Self::Cardioid,
             PhotonSceneArg::Lens => Self::Lens,
+            PhotonSceneArg::Luneburg => Self::GrinLuneburg,
+            PhotonSceneArg::OpticalBh => Self::GrinBlackHole,
+            PhotonSceneArg::Mirage => Self::GrinMirage,
             PhotonSceneArg::KerrBeam => Self::KerrBeam,
             PhotonSceneArg::KerrPulsar => Self::KerrPulsar,
         }
@@ -205,9 +209,13 @@ struct PhotonArgs {
     #[arg(long, default_value_t = 0.95, allow_hyphen_values = true)]
     spin: f32,
 
-    /// Glass dispersion scale multiplier (for prism / lens).
+    /// Glass / GRIN dispersion scale multiplier (leave unset to keep preset default).
+    #[arg(long)]
+    dispersion: Option<f32>,
+
+    /// GRIN field strength multiplier (for luneburg / optical-bh / mirage).
     #[arg(long, default_value_t = 1.0)]
-    dispersion: f32,
+    strength: f32,
 
     /// Exposure multiplier.
     #[arg(long, default_value_t = 1.0)]
@@ -222,9 +230,12 @@ impl PhotonArgs {
     fn to_parts(&self) -> (PhotonScene, PhotonSettings) {
         let mut scene = PhotonScene::preset(self.scene.into());
         scene.spin = self.spin.clamp(-0.998, 0.998);
-        scene.dispersion_scale = self.dispersion.clamp(0.1, 4.0);
-        if !scene.id.is_kerr() {
-            scene.rebuild_geometry();
+        scene.grin_strength = self.strength.clamp(0.1, 3.0);
+        if let Some(d) = self.dispersion {
+            scene.dispersion_scale = d.clamp(0.0, 4.0);
+        }
+        if scene.id.is_optics() {
+            scene.compile_elements();
         }
         let settings = PhotonSettings {
             num_photons: self.photons.max(256),
@@ -584,14 +595,39 @@ fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        // Bare `caustic` opens the unified minimal studio on Dispersive Prism.
+        return run_studio(StudioConfig {
+            initial_mode: StudioMode::Photons(PhotonSceneId::Prism),
+            camera: Camera::default(),
+            bh_params: KerrParams::new(0.95, 16.0, 1000.0),
+            bh_settings: RenderSettings::default(),
+            photon_scene: PhotonScene::preset(PhotonSceneId::Prism),
+            photon_settings: PhotonSettings::default(),
+            width: 1440,
+            height: 860,
+            force_fallback: cli.software,
+        });
+    };
+
+    match command {
         Command::View {
             scene,
             width,
             height,
         } => {
             let (camera, params, settings) = scene.to_parts()?;
-            run_viewer(camera, params, settings, width, height, cli.software)
+            run_studio(StudioConfig {
+                initial_mode: StudioMode::BlackHole3D,
+                camera,
+                bh_params: params,
+                bh_settings: settings,
+                photon_scene: PhotonScene::preset(PhotonSceneId::Prism),
+                photon_settings: PhotonSettings::default(),
+                width,
+                height,
+                force_fallback: cli.software,
+            })
         }
         Command::Render {
             scene,
@@ -727,7 +763,18 @@ fn main() -> Result<()> {
                 height,
             } => {
                 let (scene, settings) = args.to_parts();
-                run_photon_viewer(scene, settings, width, height, cli.software)
+                let initial_mode = StudioMode::Photons(scene.id);
+                run_studio(StudioConfig {
+                    initial_mode,
+                    camera: Camera::default(),
+                    bh_params: KerrParams::new(0.95, 16.0, 1000.0),
+                    bh_settings: RenderSettings::default(),
+                    photon_scene: scene,
+                    photon_settings: settings,
+                    width,
+                    height,
+                    force_fallback: cli.software,
+                })
             }
             PhotonCommand::Render {
                 args,

@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT"
@@ -24,6 +24,9 @@ all = { level = "warn", priority = -1 }
 anyhow = "1.0.105"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6.9", features = ["derive"] }
+egui = { version = "0.37.0", default-features = false, features = ["default_fonts"] }
+egui-wgpu = { version = "0.37.0", default-features = false }
+egui-winit = { version = "0.37.0", default-features = false, features = ["wayland", "x11"] }
 env_logger = { version = "0.11.12", default-features = false, features = ["auto-color", "humantime"] }
 glam = "0.34.3"
 log = "0.4.35"

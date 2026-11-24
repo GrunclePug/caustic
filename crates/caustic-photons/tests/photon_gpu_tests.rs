@@ -9,7 +9,13 @@ use caustic_photons::scene::{PhotonMode, PhotonScene, PhotonSceneId};
 fn lavapipe_prism_and_kerr_beam_render_deterministically() {
     let gpu = GpuContext::new_headless(true).expect("headless lavapipe Vulkan context");
 
-    for scene_id in [PhotonSceneId::Prism, PhotonSceneId::KerrBeam] {
+    for scene_id in [
+        PhotonSceneId::Prism,
+        PhotonSceneId::GrinLuneburg,
+        PhotonSceneId::GrinBlackHole,
+        PhotonSceneId::GrinMirage,
+        PhotonSceneId::KerrBeam,
+    ] {
         let scene = PhotonScene::preset(scene_id);
         let settings = PhotonSettings {
             num_photons: 16_384,

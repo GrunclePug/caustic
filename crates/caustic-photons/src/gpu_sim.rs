@@ -11,11 +11,11 @@ use caustic_core::spectrum::build_spectral_xyz_lut;
 use wgpu::util::DeviceExt;
 
 use crate::ingoing_kerr::r_plus;
-use crate::scene::{OptCircle, OptSegment, PhotonMode, PhotonScene};
+use crate::scene::{OptCircle, OptSegment, PhotonMode, PhotonScene, PhysicsKind};
 
 /// Maximum segments / circles supported in scene storage buffers.
-const MAX_SEGMENTS: usize = 64;
-const MAX_CIRCLES: usize = 64;
+const MAX_SEGMENTS: usize = 128;
+const MAX_CIRCLES: usize = 128;
 /// Fixed-point multiplier for `atomic<u32>` spectral CIE XYZ deposits.
 const FIXED_SCALE: f32 = 1024.0;
 
@@ -26,6 +26,7 @@ struct SimUniforms {
     view: [f32; 4],
     emitter: [f32; 4],
     physics: [f32; 4],
+    extra: [f32; 4],
     dims: [u32; 4],
     flags: [u32; 4],
     counts: [u32; 4],
@@ -73,6 +74,9 @@ pub struct PhotonSettings {
     pub exposure: f32,
     /// Deterministic PRNG seed.
     pub seed: u32,
+    /// When true (during active mouse/slider dragging), uses a leaner per-frame batch and
+    /// wider stochastic splat stride for locked 200+ FPS live responsiveness.
+    pub interactive_drag: bool,
 }
 
 impl Default for PhotonSettings {
@@ -86,6 +90,7 @@ impl Default for PhotonSettings {
             pulse_period_frames: 110,
             exposure: 1.0,
             seed: 42,
+            interactive_drag: false,
         }
     }
 }
@@ -448,21 +453,34 @@ impl PhotonPipeline {
 
     /// Active photons dispatched per frame (full end-to-end trajectories in Accumulate mode;
     /// full persistent pool in Pulse mode).
-    pub fn dispatched_photons(&self, scene: &PhotonScene, mode: PhotonMode) -> u32 {
-        match mode {
+    pub fn dispatched_photons(&self, scene: &PhotonScene, settings: &PhotonSettings) -> u32 {
+        match settings.mode {
             PhotonMode::Pulse => self.num_photons,
             PhotonMode::Accumulate => {
-                if scene.id.is_kerr() {
-                    (self.num_photons / 32)
-                        .clamp(256, 32_768)
-                        .min(self.num_photons)
-                } else {
-                    (self.num_photons / 16)
-                        .clamp(256, 65_536)
-                        .min(self.num_photons)
-                }
+                let phys = scene.id.physics_kind();
+                let (div, cap) = match (phys, settings.interactive_drag) {
+                    (PhysicsKind::Optics, true) => (40, 24_576),
+                    (PhysicsKind::Optics, false) => (20, 49_152),
+                    (_, true) => (64, 16_384),
+                    (_, false) => (40, 24_576),
+                };
+                (self.num_photons / div)
+                    .clamp(256, cap)
+                    .min(self.num_photons)
             }
         }
+    }
+
+    /// Re-present the already-converged HDR buffer through AgX without stepping new photons
+    /// (~0.01 ms GPU cost when an Accumulate scene has finished settling).
+    pub fn encode_present_only(
+        &self,
+        gpu: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+    ) {
+        self.agx_pass
+            .encode(gpu, encoder, &self.sized.agx_bg, target_view, 1.0, None);
     }
 
     /// Fire a fresh synchronized photon pulse (keeping existing fading trails in Pulse mode).
@@ -503,7 +521,8 @@ impl PhotonPipeline {
         let w = self.sized.width;
         let h = self.sized.height;
         let aspect = (w as f32) / (h as f32);
-        let is_kerr = scene.id.is_kerr();
+        let phys = scene.id.physics_kind();
+        let is_kerr = phys == PhysicsKind::Kerr;
         let spin = scene.spin.clamp(-0.998, 0.998);
         let rp = r_plus(f64::from(spin)) as f32;
 
@@ -522,15 +541,24 @@ impl PhotonPipeline {
             self.accum_frames += 1;
         }
 
-        // Tune step scale so optical scenes (~10 units wide) and Kerr scenes (~28M wide)
-        // traverse at an intuitive real-time visual speed!
+        // Tune step scale so optical/GRIN scenes (~10 units wide) and Kerr scenes (~28M wide)
+        // traverse at an intuitive real-time visual speed in Pulse mode.
         let dt_substep = if is_kerr {
             settings.dt_substep * 2.2
         } else {
             settings.dt_substep
         };
 
-        let active_photons = self.dispatched_photons(scene, settings.mode);
+        // Unbiased stochastic strided splatting cuts atomic contention by ~3-4x on narrow beams
+        // and high-DPI displays while keeping expected irradiance identical.
+        let splat_stride = match (settings.mode, settings.interactive_drag, phys) {
+            (PhotonMode::Pulse, _, _) => 1.5,
+            (PhotonMode::Accumulate, true, _) => 4.0,
+            (PhotonMode::Accumulate, false, PhysicsKind::Optics) => 2.5,
+            (PhotonMode::Accumulate, false, _) => 2.0,
+        };
+
+        let active_photons = self.dispatched_photons(scene, settings);
         let sim_u = SimUniforms {
             view: [
                 scene.view_center[0],
@@ -545,9 +573,15 @@ impl PhotonPipeline {
                 scene.emitter_spread,
             ],
             physics: [dt_substep, spin, rp, FIXED_SCALE],
+            extra: [
+                splat_stride,
+                scene.grin_strength.clamp(0.1, 3.0),
+                scene.dispersion_scale.clamp(0.0, 4.0),
+                0.0,
+            ],
             dims: [w, h, active_photons, settings.substeps.max(1)],
             flags: [
-                u32::from(is_kerr),
+                phys as u32,
                 settings.mode as u32,
                 scene.emitter_kind,
                 u32::from(pulse_trigger),
@@ -564,13 +598,14 @@ impl PhotonPipeline {
 
         // Exact step-size-invariant arc-length splatting scales per-pixel density linearly with
         // (active_photons / height), so multiplying by (height / active_photons) keeps visual
-        // exposure consistent across all resolutions and photon counts.
+        // exposure consistent across all resolutions, drag/settle budgets, and photon counts.
         let norm = (h as f32) / (active_photons as f32).max(1.0);
-        let gain_k = match (settings.mode, is_kerr) {
-            (PhotonMode::Accumulate, false) => 0.16,
-            (PhotonMode::Accumulate, true) => 0.14,
-            (PhotonMode::Pulse, false) => 0.70,
-            (PhotonMode::Pulse, true) => 0.42,
+        let gain_k = match (settings.mode, phys) {
+            (PhotonMode::Accumulate, PhysicsKind::Optics) => 0.16,
+            (PhotonMode::Accumulate, PhysicsKind::Kerr) => 0.14,
+            (PhotonMode::Accumulate, _) => 0.22,
+            (PhotonMode::Pulse, PhysicsKind::Kerr) => 0.42,
+            (PhotonMode::Pulse, _) => 0.70,
         };
         let base_gain = gain_k * norm * settings.exposure;
         let accum_norm = 1.0 / (self.accum_frames as f32).max(1.0);
@@ -583,8 +618,13 @@ impl PhotonPipeline {
                 base_gain,
                 accum_norm,
             ],
-            kerr: [spin, rp, 0.0, 0.0],
-            dims: [w, h, u32::from(is_kerr), settings.mode as u32],
+            kerr: [
+                spin,
+                rp,
+                scene.grin_strength.clamp(0.1, 3.0),
+                scene.dispersion_scale.clamp(0.0, 4.0),
+            ],
+            dims: [w, h, phys as u32, settings.mode as u32],
             counts: [
                 scene.segments.len().min(MAX_SEGMENTS) as u32,
                 scene.circles.len().min(MAX_CIRCLES) as u32,
@@ -704,7 +744,7 @@ impl PhotonPipeline {
 
         let p1 = pass_ms.as_ref().map(|v| v[0]);
         let step_sec = p1.unwrap_or(last_wall_ms) * 1e-3;
-        let dispatched = self.dispatched_photons(scene, settings.mode);
+        let dispatched = self.dispatched_photons(scene, settings);
         let work_units = match settings.mode {
             PhotonMode::Accumulate => f64::from(dispatched),
             PhotonMode::Pulse => f64::from(dispatched) * f64::from(settings.substeps.max(1)),
@@ -813,7 +853,7 @@ impl PhotonPipeline {
         let med_p2 = (!p2s.is_empty()).then(|| med(&mut p2s));
         let med_p3 = (!p3s.is_empty()).then(|| med(&mut p3s));
         let step_sec = med_p1.unwrap_or(med_wall) * 1e-3;
-        let dispatched = self.dispatched_photons(scene, settings.mode);
+        let dispatched = self.dispatched_photons(scene, settings);
         let work_units = match settings.mode {
             PhotonMode::Accumulate => f64::from(dispatched),
             PhotonMode::Pulse => f64::from(dispatched) * f64::from(settings.substeps.max(1)),
