@@ -3,6 +3,8 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::solar::{SolarGpuFrame, SolarSystem};
+
 /// Physics backend selector shared with `photon_step.wgsl` and `photon_resolve.wgsl`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -164,6 +166,8 @@ pub const EMITTER_BEAM: u32 = 0;
 pub const EMITTER_POINT: u32 = 1;
 pub const EMITTER_SPOT: u32 = 2;
 pub const EMITTER_DISK: u32 = 3;
+/// Frustum importance-sampled finite-angular-disk distant star (used by floating-origin Solar System).
+pub const EMITTER_SOLAR_FAR: u32 = 4;
 
 /// Emitter spectrum modes shared with `photon_step.wgsl`.
 pub const SPEC_WHITE_FLAT: u32 = 0;
@@ -477,8 +481,12 @@ pub struct PhotonScene {
     pub dispersion_scale: f32,
     /// GRIN field strength multiplier (`1.0` default).
     pub grin_strength: f32,
-    /// Orbital animation speed multiplier (for `SolarSystem`, `0.0` = paused).
+    /// Orbital animation speed multiplier (legacy; SolarSystem uses `solar.time_warp`).
     pub orbit_speed: f32,
+    /// Double-precision true-ratio Solar System model (active when `id == PhotonSceneId::SolarSystem`).
+    pub solar: SolarSystem,
+    /// Most recently compiled Solar System floating-origin GPU snapshot (for HUD overlays & telemetry).
+    pub last_solar_frame: Option<SolarGpuFrame>,
     /// High-level editable optical & planetary elements (compiled into `segments` and `circles`).
     pub elements: Vec<OpticalElement>,
     next_element_id: u32,
@@ -501,6 +509,8 @@ impl PhotonScene {
             dispersion_scale: 1.0,
             grin_strength: 1.0,
             orbit_speed: 0.35,
+            solar: SolarSystem::new(),
+            last_solar_frame: None,
             elements: Vec::new(),
             next_element_id: 1,
             segments: Vec::new(),
@@ -560,8 +570,27 @@ impl PhotonScene {
         best.map(|(i, _)| i)
     }
 
+    /// Synchronize the double-precision floating-origin Solar System into normalized GPU buffers
+    /// (`view_center = [0, 0]`, `view_half_height = 1.0`) for the given viewport `aspect`.
+    pub fn sync_solar_to_gpu(&mut self, aspect: f64) {
+        if !self.id.is_solar_system() {
+            return;
+        }
+        let frame = self.solar.compile_to_gpu(aspect);
+        self.view_center = [0.0, 0.0];
+        self.view_half_height = 1.0;
+        self.segments = frame.segments.clone();
+        self.circles = frame.circles.clone();
+        self.last_solar_frame = Some(frame);
+    }
+
     /// Pack all emitters into GPU records with cumulative power distribution for multi-emitter sampling.
     pub fn pack_gpu_emitters(&self) -> Vec<GpuEmitter> {
+        if self.id.is_solar_system()
+            && let Some(sf) = &self.last_solar_frame
+        {
+            return sf.emitters.clone();
+        }
         let total_power: f32 = self
             .emitters
             .iter()
@@ -708,6 +737,9 @@ impl PhotonScene {
 
     /// Compile `self.elements` into GPU `segments` and `circles` without touching emitters or camera.
     pub fn compile_elements(&mut self) {
+        if self.id.is_solar_system() {
+            return;
+        }
         self.segments.clear();
         self.circles.clear();
         let disp = self.dispersion_scale.clamp(0.0, 4.0);
@@ -944,173 +976,10 @@ impl PhotonScene {
                 );
             }
             PhotonSceneId::SolarSystem => {
-                // Orrery-scale Solar System: true 5778 K Planck solar disk casting soft umbra/penumbra
-                // shadows onto Mercury, Venus (dense golden atmosphere), Earth (Rayleigh blue sky +
-                // orbiting Moon for real solar & blood-moon lunar eclipses!), Mars, Jupiter, and Saturn.
-                self.view_half_height = 10.5;
-                self.view_center = [0.0, 0.0];
+                // Exact true-ratio Solar System with f64 Keplerian orbits and floating-origin camera!
+                self.solar = SolarSystem::new();
                 self.dispersion_scale = 1.0;
-                self.orbit_speed = 0.25;
-
-                // Physical 5778 K Sun disk at the center.
-                self.add_emitter(
-                    EmitterKind::Disk,
-                    EmitterSpectrum::Blackbody(5778.0),
-                    [0.0, 0.0],
-                    0.0,
-                    1.15,
-                    1.0,
-                );
-
-                let place = |r: f32, ang: f32| [r * ang.cos(), r * ang.sin()];
-
-                // Mercury
-                let merc_r = 2.45;
-                let merc_a = 2.35;
-                self.add_element(
-                    "Mercury",
-                    ElementKind::Planet {
-                        radius: 0.24,
-                        albedo: [0.52, 0.50, 0.48],
-                        atmo_thickness: 0.0,
-                        atmo_density: 0.0,
-                        ring_outer: 0.0,
-                        orbit_radius: merc_r,
-                        orbit_speed: 1.55,
-                        orbit_phase: merc_a,
-                        parent_idx: None,
-                    },
-                    place(merc_r, merc_a),
-                    0.0,
-                    GlassMaterial::CrownBk7,
-                );
-
-                // Venus (thick golden scattering cloud atmosphere)
-                let ven_r = 3.75;
-                let ven_a = -0.85;
-                self.add_element(
-                    "Venus",
-                    ElementKind::Planet {
-                        radius: 0.42,
-                        albedo: [0.88, 0.78, 0.54],
-                        atmo_thickness: 0.42,
-                        atmo_density: 2.2,
-                        ring_outer: 0.0,
-                        orbit_radius: ven_r,
-                        orbit_speed: 0.98,
-                        orbit_phase: ven_a,
-                        parent_idx: None,
-                    },
-                    place(ven_r, ven_a),
-                    0.0,
-                    GlassMaterial::CrownBk7,
-                );
-
-                // Earth (Rayleigh sky-blue atmosphere!)
-                let earth_r = 5.45;
-                let earth_a = 0.42;
-                let earth_idx = self.add_element(
-                    "Earth",
-                    ElementKind::Planet {
-                        radius: 0.50,
-                        albedo: [0.30, 0.52, 0.78],
-                        atmo_thickness: 0.48,
-                        atmo_density: 2.1,
-                        ring_outer: 0.0,
-                        orbit_radius: earth_r,
-                        orbit_speed: 0.65,
-                        orbit_phase: earth_a,
-                        parent_idx: None,
-                    },
-                    place(earth_r, earth_a),
-                    0.0,
-                    GlassMaterial::CrownBk7,
-                );
-
-                // Moon orbiting Earth (positioned near eclipse alignment!)
-                let ep = place(earth_r, earth_a);
-                let moon_r = 1.15;
-                let moon_a = earth_a + 0.12;
-                self.add_element(
-                    "Moon",
-                    ElementKind::Planet {
-                        radius: 0.18,
-                        albedo: [0.68, 0.67, 0.64],
-                        atmo_thickness: 0.0,
-                        atmo_density: 0.0,
-                        ring_outer: 0.0,
-                        orbit_radius: moon_r,
-                        orbit_speed: 2.8,
-                        orbit_phase: moon_a,
-                        parent_idx: Some(earth_idx),
-                    },
-                    [ep[0] + moon_r * moon_a.cos(), ep[1] + moon_r * moon_a.sin()],
-                    0.0,
-                    GlassMaterial::CrownBk7,
-                );
-
-                // Mars (dusty iron-oxide red albedo + thin atmosphere)
-                let mars_r = 7.35;
-                let mars_a = 2.72;
-                self.add_element(
-                    "Mars",
-                    ElementKind::Planet {
-                        radius: 0.34,
-                        albedo: [0.84, 0.36, 0.22],
-                        atmo_thickness: 0.24,
-                        atmo_density: 0.65,
-                        ring_outer: 0.0,
-                        orbit_radius: mars_r,
-                        orbit_speed: 0.44,
-                        orbit_phase: mars_a,
-                        parent_idx: None,
-                    },
-                    place(mars_r, mars_a),
-                    0.0,
-                    GlassMaterial::CrownBk7,
-                );
-
-                // Jupiter (large bright gas giant casting a dramatic long umbra/penumbra shadow)
-                let jup_r = 9.5;
-                let jup_a = -2.18;
-                self.add_element(
-                    "Jupiter",
-                    ElementKind::Planet {
-                        radius: 0.88,
-                        albedo: [0.85, 0.72, 0.56],
-                        atmo_thickness: 0.18,
-                        atmo_density: 0.9,
-                        ring_outer: 0.0,
-                        orbit_radius: jup_r,
-                        orbit_speed: 0.24,
-                        orbit_phase: jup_a,
-                        parent_idx: None,
-                    },
-                    place(jup_r, jup_a),
-                    0.0,
-                    GlassMaterial::CrownBk7,
-                );
-
-                // Saturn (golden gas giant with translucent icy rings)
-                let sat_r = 12.2;
-                let sat_a = -0.22;
-                self.add_element(
-                    "Saturn",
-                    ElementKind::Planet {
-                        radius: 0.72,
-                        albedo: [0.88, 0.79, 0.58],
-                        atmo_thickness: 0.16,
-                        atmo_density: 0.7,
-                        ring_outer: 1.55,
-                        orbit_radius: sat_r,
-                        orbit_speed: 0.15,
-                        orbit_phase: sat_a,
-                        parent_idx: None,
-                    },
-                    place(sat_r, sat_a),
-                    0.48,
-                    GlassMaterial::CrownBk7,
-                );
+                self.sync_solar_to_gpu(16.0 / 9.0);
             }
             PhotonSceneId::Sandbox => {
                 // Multi-emitter playground starter: a 532nm green laser + white spotlight + beam splitter

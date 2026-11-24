@@ -19,6 +19,10 @@ use caustic_core::gpu::GpuContext;
 use caustic_core::post::{DebugView, write_rgba8_png};
 use caustic_photons::gpu_sim::{PhotonPipeline, PhotonSettings, PhotonTelemetry};
 use caustic_photons::scene::{PhotonMode, PhotonScene, PhotonSceneId};
+use caustic_photons::solar::{
+    BODY_EARTH, BODY_IO, BODY_JUPITER, BODY_MARS, BODY_MERCURY, BODY_MOON, BODY_NEPTUNE, BODY_SUN,
+    BODY_URANUS, BODY_VENUS, SolarFocus, SolarScale,
+};
 
 use crate::studio::{StudioConfig, StudioMode, run_studio};
 
@@ -98,6 +102,41 @@ impl From<PhotonModeArg> for PhotonMode {
         match value {
             PhotonModeArg::Accumulate => Self::Accumulate,
             PhotonModeArg::Pulse => Self::Pulse,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SolarFocusArg {
+    LunarEclipse,
+    SolarEclipse,
+    Saturn,
+    IoTransit,
+    System,
+    Inner,
+    Sun,
+    Mercury,
+    Venus,
+    Earth,
+    Moon,
+    Mars,
+    Jupiter,
+    Io,
+    Uranus,
+    Neptune,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SolarScaleArg {
+    Real,
+    Ksp,
+}
+
+impl From<SolarScaleArg> for SolarScale {
+    fn from(value: SolarScaleArg) -> Self {
+        match value {
+            SolarScaleArg::Real => Self::Real1To1,
+            SolarScaleArg::Ksp => Self::Scaled1To10,
         }
     }
 }
@@ -228,17 +267,48 @@ struct PhotonArgs {
     /// Deterministic PRNG seed.
     #[arg(long, default_value_t = 42)]
     seed: u32,
+
+    /// Solar System camera focus or staged astronomical event (`--scene solar-system`).
+    #[arg(long, value_enum)]
+    solar_focus: Option<SolarFocusArg>,
+
+    /// Solar System linear scale (`real` = 1:1 NASA, `ksp` = 1:10 KSP/KSA; ratios identical).
+    #[arg(long, value_enum, default_value_t = SolarScaleArg::Real)]
+    solar_scale: SolarScaleArg,
 }
 
 impl PhotonArgs {
-    fn to_parts(&self) -> (PhotonScene, PhotonSettings) {
+    fn to_parts(&self, aspect: f64) -> (PhotonScene, PhotonSettings) {
         let mut scene = PhotonScene::preset(self.scene.into());
         scene.spin = self.spin.clamp(-0.998, 0.998);
         scene.grin_strength = self.strength.clamp(0.1, 3.0);
         if let Some(d) = self.dispersion {
             scene.dispersion_scale = d.clamp(0.0, 4.0);
         }
-        if scene.id.is_optics() {
+        if scene.id.is_solar_system() {
+            scene.solar.scale = self.solar_scale.into();
+            if let Some(focus) = self.solar_focus {
+                match focus {
+                    SolarFocusArg::LunarEclipse => scene.solar.stage_lunar_eclipse(),
+                    SolarFocusArg::SolarEclipse => scene.solar.stage_solar_eclipse(),
+                    SolarFocusArg::Saturn => scene.solar.stage_saturn_rings(),
+                    SolarFocusArg::IoTransit => scene.solar.stage_jupiter_io_transit(),
+                    SolarFocusArg::System => scene.solar.set_focus(SolarFocus::System),
+                    SolarFocusArg::Inner => scene.solar.set_focus(SolarFocus::Inner),
+                    SolarFocusArg::Sun => scene.solar.set_focus(SolarFocus::Body(BODY_SUN)),
+                    SolarFocusArg::Mercury => scene.solar.set_focus(SolarFocus::Body(BODY_MERCURY)),
+                    SolarFocusArg::Venus => scene.solar.set_focus(SolarFocus::Body(BODY_VENUS)),
+                    SolarFocusArg::Earth => scene.solar.set_focus(SolarFocus::Body(BODY_EARTH)),
+                    SolarFocusArg::Moon => scene.solar.set_focus(SolarFocus::Body(BODY_MOON)),
+                    SolarFocusArg::Mars => scene.solar.set_focus(SolarFocus::Body(BODY_MARS)),
+                    SolarFocusArg::Jupiter => scene.solar.set_focus(SolarFocus::Body(BODY_JUPITER)),
+                    SolarFocusArg::Io => scene.solar.set_focus(SolarFocus::Body(BODY_IO)),
+                    SolarFocusArg::Uranus => scene.solar.set_focus(SolarFocus::Body(BODY_URANUS)),
+                    SolarFocusArg::Neptune => scene.solar.set_focus(SolarFocus::Body(BODY_NEPTUNE)),
+                }
+            }
+            scene.sync_solar_to_gpu(aspect);
+        } else if scene.id.is_optics() {
             scene.compile_elements();
         }
         let settings = PhotonSettings {
@@ -766,7 +836,8 @@ fn main() -> Result<()> {
                 width,
                 height,
             } => {
-                let (scene, settings) = args.to_parts();
+                let (scene, settings) =
+                    args.to_parts(f64::from(width.max(1)) / f64::from(height.max(1)));
                 let initial_mode = StudioMode::Photons(scene.id);
                 run_studio(StudioConfig {
                     initial_mode,
@@ -787,7 +858,8 @@ fn main() -> Result<()> {
                 frames,
                 output,
             } => {
-                let (scene, settings) = args.to_parts();
+                let (scene, settings) =
+                    args.to_parts(f64::from(width.max(1)) / f64::from(height.max(1)));
                 let gpu = GpuContext::new_headless(cli.software)?;
                 let mut pipeline = PhotonPipeline::new(
                     &gpu,
@@ -813,7 +885,8 @@ fn main() -> Result<()> {
                 height,
                 iters,
             } => {
-                let (scene, settings) = args.to_parts();
+                let (scene, settings) =
+                    args.to_parts(f64::from(width.max(1)) / f64::from(height.max(1)));
                 let gpu = GpuContext::new_headless(cli.software)?;
                 println!(
                     "Adapter: {} ({:?}), scene={}, mode={:?}",

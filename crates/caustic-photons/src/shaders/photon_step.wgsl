@@ -81,6 +81,7 @@ const EMITTER_BEAM: u32 = 0u;
 const EMITTER_POINT: u32 = 1u;
 const EMITTER_SPOT: u32 = 2u;
 const EMITTER_DISK: u32 = 3u;
+const EMITTER_SOLAR_FAR: u32 = 4u;
 
 const SPEC_WHITE_FLAT: u32 = 0u;
 const SPEC_BLACKBODY: u32 = 1u;
@@ -104,15 +105,15 @@ fn hash_u32(x: u32) -> u32 {
     return (v >> 22u) ^ v;
 }
 
-fn pcg_next(state: ptr<function, u32>) -> u32 {
-    let old = *state;
-    *state = old * 747796405u + 2891336453u;
-    let word = ((old >> ((old >> 28u) + 4u)) ^ old) * 277803737u;
-    return (word >> 22u) ^ word;
+// Pure value-based PCG-RXS-M-XS-32 step (zero `ptr<function, ...>` args to avoid driver alias bugs).
+fn pcg_step(state: u32) -> u32 {
+    return state * 747796405u + 2891336453u;
 }
 
-fn rand_f32(state: ptr<function, u32>) -> f32 {
-    return f32(pcg_next(state) & 0x00FFFFFFu) * (1.0 / 16777216.0);
+fn pcg_f32(state: u32) -> f32 {
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    let out = (word >> 22u) ^ word;
+    return f32(out & 0x00FFFFFFu) * (1.0 / 16777216.0);
 }
 
 fn sample_spectral_xyz(lambda_nm: f32) -> vec3<f32> {
@@ -517,30 +518,30 @@ fn intersect_scene(pos: vec2<f32>, dir: vec2<f32>, t_max: f32) -> HitInfo {
     return best;
 }
 
-fn lambertian_reflect(n_in: vec2<f32>, dir: vec2<f32>, rng: ptr<function, u32>) -> vec2<f32> {
+fn lambertian_reflect(n_in: vec2<f32>, dir: vec2<f32>, u_rand: f32) -> vec2<f32> {
     var n = n_in;
     if (dot(dir, n) > 0.0) {
         n = -n;
     }
-    let sin_a = rand_f32(rng) * 2.0 - 1.0;
+    let sin_a = u_rand * 2.0 - 1.0;
     let cos_a = sqrt(max(1.0 - sin_a * sin_a, 0.0));
     let tang = vec2<f32>(-n.y, n.x);
     return normalize(n * cos_a + tang * sin_a);
 }
 
-fn rayleigh_scatter_dir(dir: vec2<f32>, rng: ptr<function, u32>) -> vec2<f32> {
+fn rayleigh_scatter_dir(dir: vec2<f32>, u0: f32, u1: f32, u2: f32) -> vec2<f32> {
     // 2D Rayleigh dipole phase function P(theta) proportional to 1 + cos^2(theta).
-    var theta = rand_f32(rng) * TAU;
+    var theta = u0 * TAU;
     let c = cos(theta);
-    if (rand_f32(rng) > 0.5 * (1.0 + c * c)) {
-        theta = rand_f32(rng) * TAU;
+    if (u1 > 0.5 * (1.0 + c * c)) {
+        theta = u2 * TAU;
     }
     let ct = cos(theta);
     let st = sin(theta);
     return normalize(vec2<f32>(dir.x * ct - dir.y * st, dir.x * st + dir.y * ct));
 }
 
-fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
+fn spawn_photon(gid: u32, rng_in: u32) -> Photon {
     let phys = u.flags.x;
     let n_em = max(u.flags.z, 1u);
 
@@ -566,9 +567,12 @@ fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
     let em_kind = em.info.x;
     let spec_kind = em.info.y;
 
-    let r0 = rand_f32(rng);
-    let r1 = rand_f32(rng);
-    let r2 = rand_f32(rng);
+    var rng = pcg_step(rng_in);
+    let r0 = pcg_f32(rng);
+    rng = pcg_step(rng);
+    let r1 = pcg_f32(rng);
+    rng = pcg_step(rng);
+    let r2 = pcg_f32(rng);
 
     var pos = em.geom.xy;
     var aim = vec2<f32>(cos(base_ang), sin(base_ang));
@@ -584,11 +588,22 @@ fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
         let ang_off = (local_u * 2.0 - 1.0) * spread + (r0 - 0.5) * 0.004;
         let ang = base_ang + ang_off;
         aim = vec2<f32>(cos(ang), sin(ang));
+    } else if (em_kind == EMITTER_SOLAR_FAR) {
+        // Frustum importance-sampled distant Sun with exact finite angular half-radius `alpha_sun`.
+        let alpha_sun = em.spec.w;
+        let d_spawn = bitcast<f32>(em.info.z);
+        let base_dir = vec2<f32>(cos(base_ang), sin(base_ang));
+        let perp = vec2<f32>(-base_dir.y, base_dir.x);
+        let lane_step = (2.0 * spread) / max(f32(u.dims.z) * (cdf_hi - cdf_lo), 1.0);
+        let u_lat = (local_u * 2.0 - 1.0) * spread + (r0 - 0.5) * lane_step;
+        let ang = base_ang + (r2 * 2.0 - 1.0) * alpha_sun;
+        aim = vec2<f32>(cos(ang), sin(ang));
+        pos = perp * u_lat - aim * d_spawn;
     } else {
         // EMITTER_DISK: glowing physical star/Sun photosphere casting real umbra & soft penumbra!
         let rim_ang = local_u * TAU + r0 * 0.02;
         let out_n = vec2<f32>(cos(rim_ang), sin(rim_ang));
-        pos = pos + out_n * (max(spread, 0.05) + 1e-3);
+        pos = pos + out_n * (max(spread, 1e-5) + 1e-5);
         let tang = vec2<f32>(-out_n.y, out_n.x);
         let sin_rel = select(r2 * 2.0 - 1.0, (r2 * 2.0 - 1.0) * 0.35, u.flags.y != MODE_ACCUMULATE);
         let cos_rel = sqrt(max(1.0 - sin_rel * sin_rel, 0.0));
@@ -608,7 +623,7 @@ fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
         let energy = ep.x;
         let p = ep.yz;
         let lambda_emit = mix(585.0, 610.0, r1);
-        return Photon(pos, p, lambda_emit, energy, *rng, base_flags);
+        return Photon(pos, p, lambda_emit, energy, rng, base_flags);
     }
 
     var lambda_nm = mix(LAMBDA_MIN, LAMBDA_MAX, r1);
@@ -625,10 +640,10 @@ fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
         }
         let ge = eval_grin(phys, pos, lambda_nm);
         let p = aim * sqrt(max(ge.n2, 0.1));
-        return Photon(pos, p, lambda_nm, 1.0, *rng, base_flags);
+        return Photon(pos, p, lambda_nm, 1.0, rng, base_flags);
     }
 
-    return Photon(pos, aim, lambda_nm, 1.0, *rng, base_flags);
+    return Photon(pos, aim, lambda_nm, 1.0, rng, base_flags);
 }
 
 @compute @workgroup_size(256, 1, 1)
@@ -650,9 +665,9 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
     let bound_y = half_h * 2.4;
 
     if (mode == MODE_ACCUMULATE) {
-        var rng = hash_u32(gid ^ hash_u32(u.counts.z * 0x9E3779B9u ^ hash_u32(u.counts.w)));
-        let _w0 = pcg_next(&rng);
-        var ph = spawn_photon(gid, &rng);
+        let init_rng = pcg_step(hash_u32(gid ^ hash_u32(u.counts.z * 0x9E3779B9u ^ hash_u32(u.counts.w))));
+        var ph = spawn_photon(gid, init_rng);
+        var rng = ph.rng;
         let em_idx = (ph.flags >> 2u) & 15u;
 
         if (phys == PHYS_KERR) {
@@ -681,7 +696,8 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
 
                 let nu_loc = equatorial_zamo_nu(pos1, p1, energy, a, a2, rp);
                 let col = kerr_spectral_xyz(ph.lambda_nm, nu_loc);
-                splat_segment_xyz(pos0, pos1, col.xyz, col.w, rand_f32(&rng));
+                rng = pcg_step(rng);
+                splat_segment_xyz(pos0, pos1, col.xyz, col.w, pcg_f32(rng));
 
                 ph.pos = pos1;
                 ph.p = p1;
@@ -693,7 +709,8 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
         } else if (phys >= PHYS_GRIN_LUNEBURG) {
             let spec_w = emitter_spectral_weight(em_idx, ph.lambda_nm);
             let xyz = sample_spectral_xyz(ph.lambda_nm) * spec_w;
-            let h_jit = mix(0.82, 1.18, rand_f32(&rng));
+            rng = pcg_step(rng);
+            let h_jit = mix(0.82, 1.18, pcg_f32(rng));
             for (var step = 0u; step < 440u; step = step + 1u) {
                 let pos0 = ph.pos;
                 let p0 = ph.p;
@@ -711,12 +728,13 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                 let next = grin_rk4_step(phys, pos0, p0, ph.lambda_nm, h);
                 let pos1 = next.xy;
                 let p1 = next.zw;
+                rng = pcg_step(rng);
                 if (grin_absorbed(phys, pos1)) {
-                    splat_segment_xyz(pos0, pos1, xyz, 1.0, rand_f32(&rng));
+                    splat_segment_xyz(pos0, pos1, xyz, 1.0, pcg_f32(rng));
                     break;
                 }
 
-                splat_segment_xyz(pos0, pos1, xyz, 1.0, rand_f32(&rng));
+                splat_segment_xyz(pos0, pos1, xyz, 1.0, pcg_f32(rng));
                 ph.pos = pos1;
                 ph.p = p1;
                 let rel = abs(pos1 - u.view.xy);
@@ -729,7 +747,8 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
             // planetary Rayleigh atmospheres, and absorbers).
             let spec_w = emitter_spectral_weight(em_idx, ph.lambda_nm);
             let xyz = sample_spectral_xyz(ph.lambda_nm) * spec_w;
-            let max_dist = length(vec2<f32>(bound_x, bound_y)) * 2.5;
+            let spawn_dist = length(ph.pos - u.view.xy);
+            let max_dist = spawn_dist + length(vec2<f32>(bound_x, bound_y)) * 2.5;
             var in_atmo = false;
             var atmo_density = 0.0;
 
@@ -738,21 +757,33 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                 let seg_len = select(max_dist, hit.t, hit.t <= max_dist);
 
                 // Beer-Lambert + Rayleigh (1 / lambda^4) scattering inside planetary atmospheres!
+                var did_scatter = false;
                 if (in_atmo && atmo_density > 0.0) {
                     let sigma = rayleigh_sigma(ph.lambda_nm, atmo_density);
-                    let s_scat = -log(max(1.0 - rand_f32(&rng), 1e-6)) / max(sigma, 1e-6);
+                    rng = pcg_step(rng);
+                    let s_scat = -log(max(1.0 - pcg_f32(rng), 1e-6)) / max(sigma, 1e-6);
                     if (s_scat < seg_len) {
                         let scat_pos = ph.pos + ph.p * s_scat;
-                        splat_segment_xyz(ph.pos, scat_pos, xyz, 1.0, rand_f32(&rng));
+                        rng = pcg_step(rng);
+                        splat_segment_xyz(ph.pos, scat_pos, xyz, 1.0, pcg_f32(rng));
+                        rng = pcg_step(rng);
+                        let u0 = pcg_f32(rng);
+                        rng = pcg_step(rng);
+                        let u1 = pcg_f32(rng);
+                        rng = pcg_step(rng);
+                        let u2 = pcg_f32(rng);
                         ph.pos = scat_pos;
-                        ph.p = rayleigh_scatter_dir(ph.p, &rng);
-                        continue;
+                        ph.p = rayleigh_scatter_dir(ph.p, u0, u1, u2);
+                        did_scatter = true;
                     }
                 }
 
-                if (hit.t <= max_dist) {
+                if (did_scatter) {
+                    // Continue directly to next bounce iteration.
+                } else if (hit.t <= max_dist) {
                     let hit_pos = ph.pos + ph.p * hit.t;
-                    splat_segment_xyz(ph.pos, hit_pos, xyz, 1.0, rand_f32(&rng));
+                    rng = pcg_step(rng);
+                    splat_segment_xyz(ph.pos, hit_pos, xyz, 1.0, pcg_f32(rng));
 
                     if (hit.mat_kind == MAT_ABSORBER) {
                         break;
@@ -783,7 +814,8 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                             refr_dir = normalize(eta * ph.p + (eta * cos_i - cos_t) * n_face);
                         }
 
-                        if (rand_f32(&rng) < refl) {
+                        rng = pcg_step(rng);
+                        if (pcg_f32(rng) < refl) {
                             ph.p = normalize(ph.p - 2.0 * dot(ph.p, n_face) * n_face);
                             ph.pos = hit_pos + n_face * 5e-5;
                         } else {
@@ -792,13 +824,15 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                         }
                     } else if (hit.mat_kind == MAT_DIFFUSE) {
                         let refl = spectral_albedo(ph.lambda_nm, hit.mat.xyz);
-                        if (rand_f32(&rng) < refl) {
+                        rng = pcg_step(rng);
+                        if (pcg_f32(rng) < refl) {
                             var n = hit.normal;
                             if (dot(ph.p, n) > 0.0) {
                                 n = -n;
                             }
-                            ph.p = lambertian_reflect(n, ph.p, &rng);
-                            ph.pos = hit_pos + n * 1e-4;
+                            rng = pcg_step(rng);
+                            ph.p = lambertian_reflect(n, ph.p, pcg_f32(rng));
+                            ph.pos = hit_pos + n * 2e-5;
                         } else {
                             break;
                         }
@@ -812,20 +846,22 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                         let cos_i = clamp(-dot(ph.p, n_face), 0.0, 1.0);
                         let eta = n1 / n2;
                         let sin2_t = eta * eta * max(1.0 - cos_i * cos_i, 0.0);
+                        let atmo_eps = clamp(hit.mat.z * 0.0015, 1e-5, 1e-4);
                         if (sin2_t < 1.0) {
                             let cos_t = sqrt(max(1.0 - sin2_t, 0.0));
                             ph.p = normalize(eta * ph.p + (eta * cos_i - cos_t) * n_face);
-                            ph.pos = hit_pos - n_face * 1e-4;
+                            ph.pos = hit_pos - n_face * atmo_eps;
                             in_atmo = entering;
                             atmo_density = select(0.0, hit.mat.x, entering);
                         } else {
-                            ph.pos = hit_pos + ph.p * 2e-4;
+                            ph.pos = hit_pos + ph.p * (atmo_eps * 2.0);
                             in_atmo = false;
                             atmo_density = 0.0;
                         }
                     } else if (hit.mat_kind == MAT_SPLITTER) {
                         let prob_refl = hit.mat.w;
-                        if (rand_f32(&rng) < prob_refl) {
+                        rng = pcg_step(rng);
+                        if (pcg_f32(rng) < prob_refl) {
                             var n = hit.normal;
                             if (dot(ph.p, n) > 0.0) {
                                 n = -n;
@@ -833,9 +869,11 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                             if (hit.subkind == 1u) {
                                 // Translucent icy planetary ring: spectral scatter or absorb.
                                 let alb = spectral_albedo(ph.lambda_nm, hit.mat.xyz);
-                                if (rand_f32(&rng) < alb) {
-                                    ph.p = lambertian_reflect(n, ph.p, &rng);
-                                    ph.pos = hit_pos + n * 1e-4;
+                                rng = pcg_step(rng);
+                                if (pcg_f32(rng) < alb) {
+                                    rng = pcg_step(rng);
+                                    ph.p = lambertian_reflect(n, ph.p, pcg_f32(rng));
+                                    ph.pos = hit_pos + n * 2e-5;
                                 } else {
                                     break;
                                 }
@@ -846,17 +884,19 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                             }
                         } else {
                             // Transmit straight through!
-                            ph.pos = hit_pos + ph.p * 2e-4;
+                            ph.pos = hit_pos + ph.p * 5e-5;
                         }
                     }
 
-                    let rel = abs(ph.pos - u.view.xy);
-                    if (rel.x > bound_x || rel.y > bound_y) {
+                    let offset = ph.pos - u.view.xy;
+                    let rel = abs(offset);
+                    if (dot(offset, ph.p) > 0.0 && (rel.x > bound_x || rel.y > bound_y)) {
                         break;
                     }
                 } else {
                     let end_pos = ph.pos + ph.p * max_dist;
-                    splat_segment_xyz(ph.pos, end_pos, xyz, 1.0, rand_f32(&rng));
+                    rng = pcg_step(rng);
+                    splat_segment_xyz(ph.pos, end_pos, xyz, 1.0, pcg_f32(rng));
                     break;
                 }
             }
@@ -868,9 +908,9 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
     var ph = photons[gid];
     var rng = ph.rng;
     if (u.counts.z == 0u || pulse_trigger) {
-        rng = hash_u32(gid ^ hash_u32(u.counts.z * 0x9E3779B9u ^ hash_u32(u.counts.w)));
-        let _w = pcg_next(&rng);
-        ph = spawn_photon(gid, &rng);
+        let init_rng = pcg_step(hash_u32(gid ^ hash_u32(u.counts.z * 0x9E3779B9u ^ hash_u32(u.counts.w))));
+        ph = spawn_photon(gid, init_rng);
+        rng = ph.rng;
     }
 
     if ((ph.flags & 1u) == 0u) {
@@ -913,7 +953,8 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
 
             let nu_loc = equatorial_zamo_nu(pos1, p1, energy, a, a2, rp);
             let col = kerr_spectral_xyz(ph.lambda_nm, nu_loc);
-            splat_segment_xyz(pos0, pos1, col.xyz, col.w, rand_f32(&rng));
+            rng = pcg_step(rng);
+            splat_segment_xyz(pos0, pos1, col.xyz, col.w, pcg_f32(rng));
 
             ph.pos = pos1;
             ph.p = p1;
@@ -942,13 +983,14 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
             let next = grin_rk4_step(phys, pos0, p0, ph.lambda_nm, h);
             let pos1 = next.xy;
             let p1 = next.zw;
+            rng = pcg_step(rng);
             if (grin_absorbed(phys, pos1)) {
-                splat_segment_xyz(pos0, pos1, xyz, 1.0, rand_f32(&rng));
+                splat_segment_xyz(pos0, pos1, xyz, 1.0, pcg_f32(rng));
                 ph.flags = ph.flags & (~1u);
                 break;
             }
 
-            splat_segment_xyz(pos0, pos1, xyz, 1.0, rand_f32(&rng));
+            splat_segment_xyz(pos0, pos1, xyz, 1.0, pcg_f32(rng));
             ph.pos = pos1;
             ph.p = p1;
             let age = (ph.flags >> 6u) + 1u;
@@ -977,23 +1019,35 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                 let hit = intersect_scene(ph.pos, ph.p, dist_budget + 2e-6);
                 let seg_len = select(dist_budget, min(hit.t, dist_budget), hit.t <= dist_budget + 2e-6);
 
+                var did_scatter = false;
                 if (in_atmo && ph.energy > 0.0) {
                     let sigma = rayleigh_sigma(ph.lambda_nm, ph.energy);
-                    let s_scat = -log(max(1.0 - rand_f32(&rng), 1e-6)) / max(sigma, 1e-6);
+                    rng = pcg_step(rng);
+                    let s_scat = -log(max(1.0 - pcg_f32(rng), 1e-6)) / max(sigma, 1e-6);
                     if (s_scat < seg_len) {
                         let scat_pos = ph.pos + ph.p * s_scat;
-                        splat_segment_xyz(ph.pos, scat_pos, xyz, 1.0, rand_f32(&rng));
+                        rng = pcg_step(rng);
+                        splat_segment_xyz(ph.pos, scat_pos, xyz, 1.0, pcg_f32(rng));
+                        rng = pcg_step(rng);
+                        let u0 = pcg_f32(rng);
+                        rng = pcg_step(rng);
+                        let u1 = pcg_f32(rng);
+                        rng = pcg_step(rng);
+                        let u2 = pcg_f32(rng);
                         ph.pos = scat_pos;
-                        ph.p = rayleigh_scatter_dir(ph.p, &rng);
+                        ph.p = rayleigh_scatter_dir(ph.p, u0, u1, u2);
                         rem_t = max(rem_t - s_scat, 0.0);
-                        continue;
+                        did_scatter = true;
                     }
                 }
 
-                if (hit.t <= dist_budget + 2e-6) {
+                if (did_scatter) {
+                    // Proceed to next bounce iteration within this substep.
+                } else if (hit.t <= dist_budget + 2e-6) {
                     let hit_t = min(hit.t, dist_budget);
                     let hit_pos = ph.pos + ph.p * hit_t;
-                    splat_segment_xyz(ph.pos, hit_pos, xyz, 1.0, rand_f32(&rng));
+                    rng = pcg_step(rng);
+                    splat_segment_xyz(ph.pos, hit_pos, xyz, 1.0, pcg_f32(rng));
                     rem_t = max(rem_t - hit_t * n_cur, 0.0);
 
                     if (hit.mat_kind == MAT_ABSORBER) {
@@ -1026,7 +1080,8 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                             refr_dir = normalize(eta * ph.p + (eta * cos_i - cos_t) * n_face);
                         }
 
-                        if (rand_f32(&rng) < refl) {
+                        rng = pcg_step(rng);
+                        if (pcg_f32(rng) < refl) {
                             ph.p = normalize(ph.p - 2.0 * dot(ph.p, n_face) * n_face);
                             ph.pos = hit_pos + n_face * 5e-5;
                             ph.energy = n1;
@@ -1038,13 +1093,15 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                         ph.flags = ph.flags & (~2u);
                     } else if (hit.mat_kind == MAT_DIFFUSE) {
                         let refl = spectral_albedo(ph.lambda_nm, hit.mat.xyz);
-                        if (rand_f32(&rng) < refl) {
+                        rng = pcg_step(rng);
+                        if (pcg_f32(rng) < refl) {
                             var n = hit.normal;
                             if (dot(ph.p, n) > 0.0) {
                                 n = -n;
                             }
-                            ph.p = lambertian_reflect(n, ph.p, &rng);
-                            ph.pos = hit_pos + n * 1e-4;
+                            rng = pcg_step(rng);
+                            ph.p = lambertian_reflect(n, ph.p, pcg_f32(rng));
+                            ph.pos = hit_pos + n * 2e-5;
                         } else {
                             ph.flags = ph.flags & (~1u);
                             break;
@@ -1058,10 +1115,11 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                         let cos_i = clamp(-dot(ph.p, n_face), 0.0, 1.0);
                         let eta = n1 / n2;
                         let sin2_t = eta * eta * max(1.0 - cos_i * cos_i, 0.0);
+                        let atmo_eps = clamp(hit.mat.z * 0.0015, 1e-5, 1e-4);
                         if (sin2_t < 1.0) {
                             let cos_t = sqrt(max(1.0 - sin2_t, 0.0));
                             ph.p = normalize(eta * ph.p + (eta * cos_i - cos_t) * n_face);
-                            ph.pos = hit_pos - n_face * 1e-4;
+                            ph.pos = hit_pos - n_face * atmo_eps;
                             if (entering) {
                                 ph.flags = ph.flags | 2u;
                                 ph.energy = hit.mat.x;
@@ -1070,22 +1128,25 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                                 ph.energy = 1.0;
                             }
                         } else {
-                            ph.pos = hit_pos + ph.p * 2e-4;
+                            ph.pos = hit_pos + ph.p * (atmo_eps * 2.0);
                             ph.flags = ph.flags & (~2u);
                             ph.energy = 1.0;
                         }
                     } else if (hit.mat_kind == MAT_SPLITTER) {
                         let prob_refl = hit.mat.w;
-                        if (rand_f32(&rng) < prob_refl) {
+                        rng = pcg_step(rng);
+                        if (pcg_f32(rng) < prob_refl) {
                             var n = hit.normal;
                             if (dot(ph.p, n) > 0.0) {
                                 n = -n;
                             }
                             if (hit.subkind == 1u) {
                                 let alb = spectral_albedo(ph.lambda_nm, hit.mat.xyz);
-                                if (rand_f32(&rng) < alb) {
-                                    ph.p = lambertian_reflect(n, ph.p, &rng);
-                                    ph.pos = hit_pos + n * 1e-4;
+                                rng = pcg_step(rng);
+                                if (pcg_f32(rng) < alb) {
+                                    rng = pcg_step(rng);
+                                    ph.p = lambertian_reflect(n, ph.p, pcg_f32(rng));
+                                    ph.pos = hit_pos + n * 2e-5;
                                 } else {
                                     ph.flags = ph.flags & (~1u);
                                     break;
@@ -1095,7 +1156,7 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                                 ph.pos = hit_pos + n * 5e-5;
                             }
                         } else {
-                            ph.pos = hit_pos + ph.p * 2e-4;
+                            ph.pos = hit_pos + ph.p * 5e-5;
                         }
                     }
 
@@ -1107,14 +1168,18 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                     ph.flags = (ph.flags & 63u) | (bounces << 6u);
                 } else {
                     let next_pos = ph.pos + ph.p * dist_budget;
-                    splat_segment_xyz(ph.pos, next_pos, xyz, 1.0, rand_f32(&rng));
+                    rng = pcg_step(rng);
+                    splat_segment_xyz(ph.pos, next_pos, xyz, 1.0, pcg_f32(rng));
                     ph.pos = next_pos;
                     rem_t = 0.0;
                 }
             }
 
-            let rel = abs(ph.pos - u.view.xy);
-            if (rel.x > bound_x || rel.y > bound_y) {
+            let offset = ph.pos - u.view.xy;
+            let rel = abs(offset);
+            if ((dot(offset, ph.p) > 0.0 && (rel.x > bound_x || rel.y > bound_y))
+                || max(rel.x, rel.y) > max(bound_x, bound_y) * 16.0)
+            {
                 ph.flags = ph.flags & (~1u);
             }
         }

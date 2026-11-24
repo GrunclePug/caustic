@@ -568,10 +568,12 @@ impl PhotonPipeline {
             self.accum_frames += 1;
         }
 
-        // Tune step scale so optical/GRIN scenes (~10 units wide) and Kerr scenes (~28M wide)
-        // traverse at an intuitive real-time visual speed in Pulse mode.
+        // Tune step scale so optical/GRIN scenes (~10 units wide), normalized Solar System views
+        // (view_half_height = 1.0), and Kerr scenes (~28M wide) traverse at a smooth visual speed in Pulse mode.
         let dt_substep = if is_kerr {
             settings.dt_substep * 2.2
+        } else if scene.id.is_solar_system() {
+            settings.dt_substep * 0.11
         } else {
             settings.dt_substep
         };
@@ -581,6 +583,9 @@ impl PhotonPipeline {
         let splat_stride = match (settings.mode, settings.interactive_drag, phys) {
             (PhotonMode::Pulse, _, _) => 1.5,
             (PhotonMode::Accumulate, true, _) => 4.0,
+            (PhotonMode::Accumulate, false, PhysicsKind::Optics) if scene.id.is_solar_system() => {
+                1.5
+            }
             (PhotonMode::Accumulate, false, PhysicsKind::Optics) => 2.5,
             (PhotonMode::Accumulate, false, _) => 2.0,
         };
@@ -637,13 +642,29 @@ impl PhotonPipeline {
         // (active_photons / height), so multiplying by (height / active_photons) keeps visual
         // exposure consistent across all resolutions, drag/settle budgets, and photon counts.
         let norm = (h as f32) / (active_photons as f32).max(1.0);
+        let solar_far = scene
+            .last_solar_frame
+            .as_ref()
+            .is_some_and(|sf| sf.far_sun_mode);
         let gain_k = match (settings.mode, phys, scene.id.is_solar_system()) {
-            (PhotonMode::Accumulate, PhysicsKind::Optics, true) => 0.42,
+            (PhotonMode::Accumulate, PhysicsKind::Optics, true) => {
+                if solar_far {
+                    0.26
+                } else {
+                    0.30
+                }
+            }
             (PhotonMode::Accumulate, PhysicsKind::Optics, false) => 0.16 * total_power.sqrt(),
             (PhotonMode::Accumulate, PhysicsKind::Kerr, _) => 0.14,
             (PhotonMode::Accumulate, _, _) => 0.22,
             (PhotonMode::Pulse, PhysicsKind::Kerr, _) => 0.42,
-            (PhotonMode::Pulse, _, true) => 1.25,
+            (PhotonMode::Pulse, _, true) => {
+                if solar_far {
+                    1.15
+                } else {
+                    0.95
+                }
+            }
             (PhotonMode::Pulse, _, false) => 0.70,
         };
         let base_gain = gain_k * norm * settings.exposure;

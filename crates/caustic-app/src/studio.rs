@@ -34,6 +34,11 @@ use caustic_photons::scene::{
     ElementKind, EmitterKind, EmitterSpectrum, GlassMaterial, PhotonMode, PhotonScene,
     PhotonSceneId, SceneCategory,
 };
+use caustic_photons::solar::{
+    BODY_EARTH, BODY_EUROPA, BODY_IO, BODY_JUPITER, BODY_MARS, BODY_MERCURY, BODY_MOON,
+    BODY_NEPTUNE, BODY_SATURN, BODY_SUN, BODY_URANUS, BODY_VENUS, SUN_RADIUS_AU, SolarFocus,
+    SolarScale, format_distance_au, format_duration_s, format_warp,
+};
 
 /// Stop stepping new photon frames in `Accumulate` mode once converged to save GPU/power.
 const MAX_CONVERGED_FRAMES: u64 = 256;
@@ -56,7 +61,7 @@ impl StudioMode {
     pub fn category_badge(self) -> &'static str {
         match self {
             Self::BlackHole3D => "3D RELATIVITY",
-            Self::Photons(PhotonSceneId::SolarSystem) => "SOLAR ORRERY",
+            Self::Photons(PhotonSceneId::SolarSystem) => "TRUE-RATIO SOLAR",
             Self::Photons(PhotonSceneId::Sandbox) => "PLAYGROUND",
             Self::Photons(id) => match id.category() {
                 SceneCategory::Optics => "OPTICAL BENCH",
@@ -96,6 +101,7 @@ enum Selection {
 #[derive(Debug, Clone, Copy)]
 enum CanvasDrag {
     Orbit3D,
+    SolarPan,
     EmitterMove { idx: usize },
     EmitterAim { idx: usize },
     ElementMove { idx: usize, offset: [f32; 2] },
@@ -202,6 +208,44 @@ impl StudioApp {
         }
     }
 
+    fn viewport_aspect(&self) -> f64 {
+        self.gfx
+            .as_ref()
+            .map(|g| {
+                f64::from(g.surface_config.width.max(1)) / f64::from(g.surface_config.height.max(1))
+            })
+            .unwrap_or(16.0 / 9.0)
+    }
+
+    fn sync_solar_scene(&mut self, clear_accum: bool, blend: bool) {
+        if !self.photon_scene.id.is_solar_system() {
+            return;
+        }
+        let aspect = self.viewport_aspect();
+        self.photon_scene.sync_solar_to_gpu(aspect);
+        // When zoomed out to map overview (System / Inner), the Sun sits still at the origin and
+        // sub-pixel planets move only on the KSP/KSA HUD overlay, so keep accumulating smoothly!
+        let static_gpu_map = !clear_accum
+            && self.photon_scene.circles.is_empty()
+            && self.photon_scene.segments.is_empty()
+            && self
+                .photon_scene
+                .last_solar_frame
+                .as_ref()
+                .is_some_and(|sf| !sf.far_sun_mode);
+        if let Some(gfx) = &mut self.gfx {
+            gfx.photon_pipeline
+                .upload_scene(&gfx.gpu, &self.photon_scene);
+            if self.photon_settings.mode == PhotonMode::Accumulate && !static_gpu_map {
+                if clear_accum {
+                    gfx.photon_pipeline.clear_accumulation();
+                } else if blend {
+                    gfx.photon_pipeline.blend_accumulation();
+                }
+            }
+        }
+    }
+
     fn switch_mode(&mut self, next: StudioMode) {
         self.mode = next;
         self.drag = None;
@@ -215,6 +259,10 @@ impl StudioApp {
             }
             StudioMode::Photons(id) => {
                 self.photon_scene = PhotonScene::preset(id);
+                if id.is_solar_system() {
+                    let aspect = self.viewport_aspect();
+                    self.photon_scene.sync_solar_to_gpu(aspect);
+                }
                 if let Some(gfx) = &mut self.gfx {
                     gfx.photon_pipeline
                         .upload_scene(&gfx.gpu, &self.photon_scene);
@@ -461,7 +509,10 @@ impl StudioApp {
                     self.bh_trace_dirty = true;
                 }
                 StudioMode::Photons(id) => {
-                    if id.is_kerr() {
+                    if id.is_solar_system() {
+                        self.photon_scene.solar.time_warp =
+                            (self.photon_scene.solar.time_warp * 2.0).clamp(1.0, 5_000_000.0);
+                    } else if id.is_kerr() {
                         self.photon_scene.spin =
                             (self.photon_scene.spin + 0.05).clamp(-0.998, 0.998);
                         self.mark_photon_edited(false, true);
@@ -478,7 +529,10 @@ impl StudioApp {
                     self.bh_trace_dirty = true;
                 }
                 StudioMode::Photons(id) => {
-                    if id.is_kerr() {
+                    if id.is_solar_system() {
+                        self.photon_scene.solar.time_warp =
+                            (self.photon_scene.solar.time_warp * 0.5).clamp(1.0, 5_000_000.0);
+                    } else if id.is_kerr() {
                         self.photon_scene.spin =
                             (self.photon_scene.spin - 0.05).clamp(-0.998, 0.998);
                         self.mark_photon_edited(false, true);
@@ -515,108 +569,215 @@ impl StudioApp {
             return actions;
         }
 
-        // 1. Subtle world-space handles & Solar System planet labels on background layer.
+        // 1. Subtle world-space handles & KSP/KSA Solar System orbit guides / reticles.
         if let StudioMode::Photons(scene_id) = self.mode {
             let painter = ctx.layer_painter(LayerId::background());
-            for (i, em) in self.photon_scene.emitters.iter().enumerate() {
-                let selected = self.selection == Selection::Emitter(i);
-                let em_pos =
-                    Self::world_to_egui(em.pos, &self.photon_scene, width_px, height_px, ppp);
-                let dot_col = spectrum_preview_color(em.spectrum);
-
-                if em.kind == EmitterKind::Disk {
-                    if selected {
-                        painter.circle_stroke(
-                            em_pos,
-                            9.0,
-                            Stroke::new(1.4, Color32::from_rgba_unmultiplied(128, 190, 255, 190)),
-                        );
-                    }
-                } else {
-                    let aim = Vec2::new(em.angle.cos(), -em.angle.sin());
-                    painter.circle_filled(em_pos, if selected { 4.0 } else { 3.0 }, dot_col);
-                    painter.circle_stroke(
-                        em_pos,
-                        if selected { 7.5 } else { 5.5 },
-                        Stroke::new(
-                            if selected { 1.5 } else { 1.0 },
-                            if selected {
-                                Color32::from_rgba_unmultiplied(128, 190, 255, 220)
-                            } else {
-                                Color32::from_rgba_unmultiplied(210, 220, 235, 120)
-                            },
-                        ),
-                    );
-                    if matches!(em.kind, EmitterKind::Beam | EmitterKind::Spot) {
-                        painter.line_segment(
-                            [em_pos + aim * 7.5, em_pos + aim * 17.0],
-                            Stroke::new(
-                                1.4,
-                                if selected {
-                                    Color32::from_rgba_unmultiplied(128, 190, 255, 210)
-                                } else {
-                                    Color32::from_rgba_unmultiplied(210, 220, 235, 110)
-                                },
-                            ),
-                        );
-                    }
-                }
-            }
-
             if scene_id.is_solar_system() {
-                for el in &self.photon_scene.elements {
-                    if let ElementKind::Planet { radius, .. } = el.kind {
-                        let p = Self::world_to_egui(
-                            [el.pos[0], el.pos[1] - radius - 0.35],
+                if let Some(sf) = &self.photon_scene.last_solar_frame {
+                    let solar = &self.photon_scene.solar;
+                    let half_h_au = sf.view_half_height_au.max(1e-9);
+                    let inv_s = 1.0 / half_h_au;
+                    let c_au = sf.view_center_au;
+                    let aspect = (width_px.max(1) as f64) / (height_px.max(1) as f64);
+                    let px_per_gpu = (height_px.max(1) as f32) * 0.5 / ppp;
+
+                    // Crisp Keplerian orbit ellipses (planets in map view, moons when zoomed near host).
+                    for (i, b) in solar.bodies.iter().enumerate().skip(1) {
+                        let a_gpu = b.semi_major_au * inv_s;
+                        let a_px = (a_gpu as f32) * px_per_gpu;
+                        if !(12.0..=12_000.0).contains(&a_px) {
+                            continue;
+                        }
+                        let is_focused = solar.focus == SolarFocus::Body(i);
+                        let alpha = if is_focused { 155 } else { 82 };
+                        let col = Color32::from_rgba_unmultiplied(
+                            b.map_color[0],
+                            b.map_color[1],
+                            b.map_color[2],
+                            alpha,
+                        );
+                        let pts = solar.sample_orbit_ellipse_au(i, 96);
+                        let screen_pts: Vec<Pos2> = pts
+                            .into_iter()
+                            .map(|p| {
+                                Self::world_to_egui(
+                                    [
+                                        ((p[0] - c_au[0]) * inv_s) as f32,
+                                        ((p[1] - c_au[1]) * inv_s) as f32,
+                                    ],
+                                    &self.photon_scene,
+                                    width_px,
+                                    height_px,
+                                    ppp,
+                                )
+                            })
+                            .collect();
+                        let stroke_w = if is_focused { 1.5 } else { 1.15 };
+                        for seg in screen_pts.windows(2) {
+                            painter.line_segment([seg[0], seg[1]], Stroke::new(stroke_w, col));
+                        }
+                    }
+
+                    // KSP/KSA clickable body reticles & clean shadowed labels.
+                    for (i, b) in solar.bodies.iter().enumerate() {
+                        let Some(&gp) = sf.body_gpu_pos.get(i) else {
+                            continue;
+                        };
+                        if gp[0].abs() > aspect * 1.15 || gp[1].abs() > 1.15 {
+                            continue;
+                        }
+                        // Hide moon markers when zoomed way out so they don't overlap parent planets.
+                        if b.parent.is_some() {
+                            let orbit_px = ((b.semi_major_au * inv_s) as f32) * px_per_gpu;
+                            if orbit_px < 14.0 {
+                                continue;
+                            }
+                        }
+                        let pos = Self::world_to_egui(
+                            [gp[0] as f32, gp[1] as f32],
                             &self.photon_scene,
                             width_px,
                             height_px,
                             ppp,
                         );
+                        let r_px = (sf.body_gpu_rad[i] as f32) * px_per_gpu;
+                        let is_focused = solar.focus == SolarFocus::Body(i);
+                        let tint =
+                            Color32::from_rgb(b.map_color[0], b.map_color[1], b.map_color[2]);
+
+                        if r_px < 8.5 && i != BODY_SUN {
+                            painter.circle_filled(
+                                pos,
+                                6.8,
+                                Color32::from_rgba_unmultiplied(8, 10, 15, 145),
+                            );
+                            painter.circle_filled(pos, if is_focused { 3.2 } else { 2.5 }, tint);
+                            painter.circle_stroke(
+                                pos,
+                                if is_focused { 8.0 } else { 6.5 },
+                                Stroke::new(
+                                    if is_focused { 1.6 } else { 1.25 },
+                                    if is_focused {
+                                        Color32::from_rgba_unmultiplied(136, 198, 255, 245)
+                                    } else {
+                                        Color32::from_rgba_unmultiplied(
+                                            b.map_color[0],
+                                            b.map_color[1],
+                                            b.map_color[2],
+                                            220,
+                                        )
+                                    },
+                                ),
+                            );
+                        } else if is_focused && r_px < 90.0 {
+                            painter.circle_stroke(
+                                pos,
+                                r_px + 5.0,
+                                Stroke::new(
+                                    1.1,
+                                    Color32::from_rgba_unmultiplied(136, 198, 255, 130),
+                                ),
+                            );
+                        }
+
+                        let lbl_pos = pos + Vec2::new(0.0, r_px.max(7.0) + 5.0);
                         painter.text(
-                            p + Vec2::new(1.0, 1.0),
+                            lbl_pos + Vec2::new(1.0, 1.0),
                             Align2::CENTER_TOP,
-                            el.name,
+                            b.name,
                             FontId::proportional(10.0),
-                            Color32::from_rgba_unmultiplied(0, 0, 0, 210),
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 220),
                         );
                         painter.text(
-                            p,
+                            lbl_pos,
                             Align2::CENTER_TOP,
-                            el.name,
+                            b.name,
                             FontId::proportional(10.0),
-                            Color32::from_rgba_unmultiplied(230, 238, 250, 215),
+                            if is_focused {
+                                Color32::from_rgb(245, 249, 255)
+                            } else {
+                                Color32::from_rgba_unmultiplied(222, 232, 246, 205)
+                            },
                         );
                     }
                 }
-            }
+            } else {
+                for (i, em) in self.photon_scene.emitters.iter().enumerate() {
+                    let selected = self.selection == Selection::Emitter(i);
+                    let em_pos =
+                        Self::world_to_egui(em.pos, &self.photon_scene, width_px, height_px, ppp);
+                    let dot_col = spectrum_preview_color(em.spectrum);
 
-            if let Selection::Element(idx) = self.selection
-                && let Some(el) = self.photon_scene.elements.get(idx)
-            {
-                let h_pos = Self::world_to_egui(
-                    el.handle_pos(),
-                    &self.photon_scene,
-                    width_px,
-                    height_px,
-                    ppp,
-                );
-                let dir = Vec2::new(el.angle.cos(), -el.angle.sin());
-                painter.circle_stroke(
-                    h_pos,
-                    9.0,
-                    Stroke::new(1.6, Color32::from_rgb(122, 186, 255)),
-                );
-                painter.circle_filled(
-                    h_pos,
-                    3.0,
-                    Color32::from_rgba_unmultiplied(122, 186, 255, 220),
-                );
-                if !matches!(el.kind, ElementKind::Planet { ring_outer, .. } if ring_outer <= 0.0) {
-                    painter.line_segment(
-                        [h_pos + dir * 9.0, h_pos + dir * 20.0],
-                        Stroke::new(1.4, Color32::from_rgba_unmultiplied(122, 186, 255, 200)),
+                    if em.kind == EmitterKind::Disk {
+                        if selected {
+                            painter.circle_stroke(
+                                em_pos,
+                                9.0,
+                                Stroke::new(
+                                    1.4,
+                                    Color32::from_rgba_unmultiplied(128, 190, 255, 190),
+                                ),
+                            );
+                        }
+                    } else {
+                        let aim = Vec2::new(em.angle.cos(), -em.angle.sin());
+                        painter.circle_filled(em_pos, if selected { 4.0 } else { 3.0 }, dot_col);
+                        painter.circle_stroke(
+                            em_pos,
+                            if selected { 7.5 } else { 5.5 },
+                            Stroke::new(
+                                if selected { 1.5 } else { 1.0 },
+                                if selected {
+                                    Color32::from_rgba_unmultiplied(128, 190, 255, 220)
+                                } else {
+                                    Color32::from_rgba_unmultiplied(210, 220, 235, 120)
+                                },
+                            ),
+                        );
+                        if matches!(em.kind, EmitterKind::Beam | EmitterKind::Spot) {
+                            painter.line_segment(
+                                [em_pos + aim * 7.5, em_pos + aim * 17.0],
+                                Stroke::new(
+                                    1.4,
+                                    if selected {
+                                        Color32::from_rgba_unmultiplied(128, 190, 255, 210)
+                                    } else {
+                                        Color32::from_rgba_unmultiplied(210, 220, 235, 110)
+                                    },
+                                ),
+                            );
+                        }
+                    }
+                }
+
+                if let Selection::Element(idx) = self.selection
+                    && let Some(el) = self.photon_scene.elements.get(idx)
+                {
+                    let h_pos = Self::world_to_egui(
+                        el.handle_pos(),
+                        &self.photon_scene,
+                        width_px,
+                        height_px,
+                        ppp,
                     );
+                    let dir = Vec2::new(el.angle.cos(), -el.angle.sin());
+                    painter.circle_stroke(
+                        h_pos,
+                        9.0,
+                        Stroke::new(1.6, Color32::from_rgb(122, 186, 255)),
+                    );
+                    painter.circle_filled(
+                        h_pos,
+                        3.0,
+                        Color32::from_rgba_unmultiplied(122, 186, 255, 220),
+                    );
+                    if !matches!(el.kind, ElementKind::Planet { ring_outer, .. } if ring_outer <= 0.0)
+                    {
+                        painter.line_segment(
+                            [h_pos + dir * 9.0, h_pos + dir * 20.0],
+                            Stroke::new(1.4, Color32::from_rgba_unmultiplied(122, 186, 255, 200)),
+                        );
+                    }
                 }
             }
         }
@@ -705,6 +866,8 @@ impl StudioApp {
                         ui.set_width(268.0);
                         egui::ScrollArea::vertical()
                             .max_height(max_panel_h)
+                            .min_scrolled_height(max_panel_h)
+                            .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 7.0;
 
@@ -788,33 +951,197 @@ impl StudioApp {
                                         });
                                     }
                                     StudioMode::Photons(id) => {
-                                        // Solar System orbital controls
+                                        // KSP/KSA True-Ratio Solar System controls (compact so all controls + telemetry fit cleanly)
                                         if id.is_solar_system() {
-                                            ui.label(
-                                                RichText::new("Orrery scale · 5778K sunlight & Rayleigh skies")
-                                                    .size(10.0)
-                                                    .color(Color32::from_rgb(138, 152, 174)),
-                                            );
+                                            ui.spacing_mut().item_spacing.y = 4.5;
+                                            ui.horizontal(|ui| {
+                                                for sc in
+                                                    [SolarScale::Real1To1, SolarScale::Scaled1To10]
+                                                {
+                                                    if mode_chip(
+                                                        ui,
+                                                        sc.label(),
+                                                        self.photon_scene.solar.scale == sc,
+                                                    ) && self.photon_scene.solar.scale != sc
+                                                    {
+                                                        self.photon_scene.solar.scale = sc;
+                                                        actions.solar_changed = true;
+                                                    }
+                                                }
+                                            });
+
+                                            section_label(ui, "EVENTS");
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                                                if ui.small_button("Lunar Eclipse").clicked() {
+                                                    self.photon_scene.solar.stage_lunar_eclipse();
+                                                    actions.solar_changed = true;
+                                                }
+                                                if ui.small_button("Solar Eclipse").clicked() {
+                                                    self.photon_scene.solar.stage_solar_eclipse();
+                                                    actions.solar_changed = true;
+                                                }
+                                                if ui.small_button("Saturn Rings").clicked() {
+                                                    self.photon_scene.solar.stage_saturn_rings();
+                                                    actions.solar_changed = true;
+                                                }
+                                                if ui.small_button("Io Transit").clicked() {
+                                                    self.photon_scene
+                                                        .solar
+                                                        .stage_jupiter_io_transit();
+                                                    actions.solar_changed = true;
+                                                }
+                                            });
+
+                                            section_label(ui, "FOCUS");
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing = Vec2::new(2.5, 2.5);
+                                                ui.spacing_mut().button_padding =
+                                                    Vec2::new(5.0, 2.2);
+                                                let targets = [
+                                                    ("System", SolarFocus::System),
+                                                    ("Inner", SolarFocus::Inner),
+                                                    ("Sun", SolarFocus::Body(BODY_SUN)),
+                                                    ("Mercury", SolarFocus::Body(BODY_MERCURY)),
+                                                    ("Venus", SolarFocus::Body(BODY_VENUS)),
+                                                    ("Earth", SolarFocus::Body(BODY_EARTH)),
+                                                    ("Moon", SolarFocus::Body(BODY_MOON)),
+                                                    ("Mars", SolarFocus::Body(BODY_MARS)),
+                                                    ("Jupiter", SolarFocus::Body(BODY_JUPITER)),
+                                                    ("Io", SolarFocus::Body(BODY_IO)),
+                                                    ("Europa", SolarFocus::Body(BODY_EUROPA)),
+                                                    ("Saturn", SolarFocus::Body(BODY_SATURN)),
+                                                    ("Uranus", SolarFocus::Body(BODY_URANUS)),
+                                                    ("Neptune", SolarFocus::Body(BODY_NEPTUNE)),
+                                                ];
+                                                for (lbl, tgt) in targets {
+                                                    let active =
+                                                        self.photon_scene.solar.focus == tgt;
+                                                    if mode_chip(ui, lbl, active) {
+                                                        self.photon_scene.solar.set_focus(tgt);
+                                                        actions.solar_changed = true;
+                                                    }
+                                                }
+                                            });
+
+                                            section_label(ui, "TIME WARP");
                                             ui.horizontal(|ui| {
                                                 let lbl = if self.orbit_paused {
-                                                    "Resume Orbits [P]"
+                                                    "Resume [P]"
                                                 } else {
-                                                    "Pause Orbits [P]"
+                                                    "Pause [P]"
                                                 };
                                                 if mode_chip(ui, lbl, !self.orbit_paused) {
                                                     self.orbit_paused = !self.orbit_paused;
                                                     if self.orbit_paused {
-                                                        actions.photon_edited = true;
+                                                        actions.solar_changed = true;
+                                                    }
+                                                }
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.label(
+                                                            RichText::new(format_warp(
+                                                                self.photon_scene.solar.time_warp,
+                                                            ))
+                                                            .monospace()
+                                                            .size(10.5)
+                                                            .color(Color32::from_rgb(
+                                                                138, 196, 255,
+                                                            )),
+                                                        );
+                                                    },
+                                                );
+                                            });
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing = Vec2::new(2.5, 2.5);
+                                                ui.spacing_mut().button_padding =
+                                                    Vec2::new(5.0, 2.2);
+                                                for (lbl, wv) in [
+                                                    ("1x", 1.0),
+                                                    ("1m", 60.0),
+                                                    ("15m", 900.0),
+                                                    ("1h", 3_600.0),
+                                                    ("1d", 86_400.0),
+                                                    ("30d", 30.0 * 86_400.0),
+                                                ] {
+                                                    let sel = (self.photon_scene.solar.time_warp
+                                                        - wv)
+                                                        .abs()
+                                                        / wv.max(1.0)
+                                                        < 0.12;
+                                                    if mode_chip(ui, lbl, sel) {
+                                                        self.photon_scene.solar.time_warp = wv;
                                                     }
                                                 }
                                             });
-                                            labeled_slider(
-                                                ui,
-                                                "Orbit Speed",
-                                                &mut self.photon_scene.orbit_speed,
-                                                0.0..=2.5,
-                                                false,
-                                            );
+
+                                            if let Some(sf) = &self.photon_scene.last_solar_frame {
+                                                let sc = self.photon_scene.solar.scale;
+                                                card_frame().show(ui, |ui| {
+                                                    ui.spacing_mut().item_spacing.y = 2.5;
+                                                    let rows = [
+                                                        (
+                                                            "View Height",
+                                                            format_distance_au(
+                                                                2.0 * sf.view_half_height_au,
+                                                                sc,
+                                                            ),
+                                                        ),
+                                                        (
+                                                            "Sun Dist",
+                                                            format_distance_au(sf.sun_dist_au, sc),
+                                                        ),
+                                                        (
+                                                            "Sun Angular Ø",
+                                                            if sf.sun_dist_au
+                                                                <= SUN_RADIUS_AU * 1.05
+                                                            {
+                                                                "—".to_string()
+                                                            } else {
+                                                                format!(
+                                                                    "{:.4}°",
+                                                                    sf.sun_angular_diam_deg
+                                                                )
+                                                            },
+                                                        ),
+                                                        (
+                                                            "Light Time",
+                                                            format_duration_s(sf.light_time_s),
+                                                        ),
+                                                    ];
+                                                    for (k, v) in rows {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(
+                                                                RichText::new(k).size(10.0).color(
+                                                                    Color32::from_rgb(
+                                                                        146, 158, 178,
+                                                                    ),
+                                                                ),
+                                                            );
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        RichText::new(v)
+                                                                            .monospace()
+                                                                            .size(10.0)
+                                                                            .color(
+                                                                                Color32::from_rgb(
+                                                                                    228, 236, 248,
+                                                                                ),
+                                                                            ),
+                                                                    );
+                                                                },
+                                                            );
+                                                        });
+                                                    }
+                                                });
+                                            }
                                             subtle_rule(ui);
                                         }
 
@@ -825,7 +1152,8 @@ impl StudioApp {
                                                 ui,
                                                 "Steady",
                                                 self.photon_settings.mode == PhotonMode::Accumulate,
-                                            ) && self.photon_settings.mode != PhotonMode::Accumulate
+                                            ) && self.photon_settings.mode
+                                                != PhotonMode::Accumulate
                                             {
                                                 self.photon_settings.mode = PhotonMode::Accumulate;
                                                 actions.photon_reset_accum = true;
@@ -845,7 +1173,9 @@ impl StudioApp {
                                                 }
                                             } else {
                                                 ui.with_layout(
-                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
                                                     |ui| {
                                                         let pct = ((accum_frames
                                                             .min(MAX_CONVERGED_FRAMES)
@@ -875,86 +1205,97 @@ impl StudioApp {
                                             );
                                         }
 
-                                        // Multi-emitter controls
-                                        subtle_rule(ui);
-                                        section_label(ui, "EMITTERS");
-                                        ui.horizontal_wrapped(|ui| {
-                                            let spawn_pos = [
-                                                self.photon_scene.view_center[0]
-                                                    - self.photon_scene.view_half_height * 0.8,
-                                                self.photon_scene.view_center[1],
-                                            ];
-                                            if ui.small_button("+ Beam").clicked() {
-                                                let idx = self.photon_scene.add_emitter(
-                                                    EmitterKind::Beam,
-                                                    EmitterSpectrum::WhiteFlat,
-                                                    spawn_pos,
-                                                    0.0,
-                                                    0.28,
-                                                    1.0,
-                                                );
-                                                self.selection = Selection::Emitter(idx);
+                                        if id.is_solar_system() {
+                                            if labeled_slider(
+                                                ui,
+                                                "Exposure",
+                                                &mut self.photon_settings.exposure,
+                                                0.15..=4.0,
+                                                true,
+                                            ) {
                                                 actions.photon_edited = true;
                                             }
-                                            if ui.small_button("+ Laser").clicked() {
-                                                let idx = self.photon_scene.add_emitter(
-                                                    EmitterKind::Beam,
-                                                    EmitterSpectrum::Laser(532.0),
-                                                    [spawn_pos[0], spawn_pos[1] - 1.2],
-                                                    0.15,
-                                                    0.08,
-                                                    0.6,
-                                                );
-                                                self.selection = Selection::Emitter(idx);
-                                                actions.photon_edited = true;
-                                            }
-                                            if ui.small_button("+ Star").clicked() {
-                                                let idx = self.photon_scene.add_emitter(
-                                                    EmitterKind::Disk,
-                                                    EmitterSpectrum::Blackbody(5778.0),
-                                                    self.photon_scene.view_center,
-                                                    0.0,
-                                                    0.65,
-                                                    1.0,
-                                                );
-                                                self.selection = Selection::Emitter(idx);
-                                                actions.photon_edited = true;
-                                            }
-                                            if ui.small_button("+ Spot").clicked() {
-                                                let idx = self.photon_scene.add_emitter(
-                                                    EmitterKind::Spot,
-                                                    EmitterSpectrum::Blackbody(5778.0),
-                                                    spawn_pos,
-                                                    0.0,
-                                                    0.35,
-                                                    1.0,
-                                                );
-                                                self.selection = Selection::Emitter(idx);
-                                                actions.photon_edited = true;
-                                            }
-                                        });
-
-                                        // Selected emitter editor card
-                                        if let Selection::Emitter(eidx) = self.selection
-                                            && eidx < self.photon_scene.emitters.len()
-                                        {
-                                            let mut del_em = false;
-                                            let can_del = self.photon_scene.emitters.len() > 1;
-                                            let em = &mut self.photon_scene.emitters[eidx];
-                                            let swatch = spectrum_preview_color(em.spectrum);
-
-                                            card_frame().show(ui, |ui| {
-                                                ui.horizontal(|ui| {
-                                                    let (r, _) = ui.allocate_exact_size(
-                                                        Vec2::splat(9.0),
-                                                        egui::Sense::hover(),
+                                        } else {
+                                            // Multi-emitter controls
+                                            subtle_rule(ui);
+                                            section_label(ui, "EMITTERS");
+                                            ui.horizontal_wrapped(|ui| {
+                                                let spawn_pos = [
+                                                    self.photon_scene.view_center[0]
+                                                        - self.photon_scene.view_half_height * 0.8,
+                                                    self.photon_scene.view_center[1],
+                                                ];
+                                                if ui.small_button("+ Beam").clicked() {
+                                                    let idx = self.photon_scene.add_emitter(
+                                                        EmitterKind::Beam,
+                                                        EmitterSpectrum::WhiteFlat,
+                                                        spawn_pos,
+                                                        0.0,
+                                                        0.28,
+                                                        1.0,
                                                     );
-                                                    ui.painter().circle_filled(
-                                                        r.center(),
-                                                        4.5,
-                                                        swatch,
+                                                    self.selection = Selection::Emitter(idx);
+                                                    actions.photon_edited = true;
+                                                }
+                                                if ui.small_button("+ Laser").clicked() {
+                                                    let idx = self.photon_scene.add_emitter(
+                                                        EmitterKind::Beam,
+                                                        EmitterSpectrum::Laser(532.0),
+                                                        [spawn_pos[0], spawn_pos[1] - 1.2],
+                                                        0.15,
+                                                        0.08,
+                                                        0.6,
                                                     );
-                                                    ui.label(
+                                                    self.selection = Selection::Emitter(idx);
+                                                    actions.photon_edited = true;
+                                                }
+                                                if ui.small_button("+ Star").clicked() {
+                                                    let idx = self.photon_scene.add_emitter(
+                                                        EmitterKind::Disk,
+                                                        EmitterSpectrum::Blackbody(5778.0),
+                                                        self.photon_scene.view_center,
+                                                        0.0,
+                                                        0.65,
+                                                        1.0,
+                                                    );
+                                                    self.selection = Selection::Emitter(idx);
+                                                    actions.photon_edited = true;
+                                                }
+                                                if ui.small_button("+ Spot").clicked() {
+                                                    let idx = self.photon_scene.add_emitter(
+                                                        EmitterKind::Spot,
+                                                        EmitterSpectrum::Blackbody(5778.0),
+                                                        spawn_pos,
+                                                        0.0,
+                                                        0.35,
+                                                        1.0,
+                                                    );
+                                                    self.selection = Selection::Emitter(idx);
+                                                    actions.photon_edited = true;
+                                                }
+                                            });
+
+                                            // Selected emitter editor card
+                                            if let Selection::Emitter(eidx) = self.selection
+                                                && eidx < self.photon_scene.emitters.len()
+                                            {
+                                                let mut del_em = false;
+                                                let can_del = self.photon_scene.emitters.len() > 1;
+                                                let em = &mut self.photon_scene.emitters[eidx];
+                                                let swatch = spectrum_preview_color(em.spectrum);
+
+                                                card_frame().show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        let (r, _) = ui.allocate_exact_size(
+                                                            Vec2::splat(9.0),
+                                                            egui::Sense::hover(),
+                                                        );
+                                                        ui.painter().circle_filled(
+                                                            r.center(),
+                                                            4.5,
+                                                            swatch,
+                                                        );
+                                                        ui.label(
                                                         RichText::new(format!(
                                                             "Emitter #{} ({})",
                                                             eidx + 1,
@@ -964,516 +1305,612 @@ impl StudioApp {
                                                         .size(11.5)
                                                         .color(Color32::from_rgb(224, 234, 248)),
                                                     );
-                                                    if can_del {
-                                                        ui.with_layout(
-                                                            egui::Layout::right_to_left(
-                                                                egui::Align::Center,
-                                                            ),
-                                                            |ui| {
-                                                                if ui.small_button("Delete").clicked()
-                                                                {
-                                                                    del_em = true;
-                                                                }
-                                                            },
-                                                        );
-                                                    }
-                                                });
-
-                                                // Shape chips
-                                                ui.horizontal_wrapped(|ui| {
-                                                    for k in [
-                                                        EmitterKind::Beam,
-                                                        EmitterKind::Point,
-                                                        EmitterKind::Spot,
-                                                        EmitterKind::Disk,
-                                                    ] {
-                                                        if mode_chip(ui, k.label(), em.kind == k)
-                                                            && em.kind != k
-                                                        {
-                                                            em.kind = k;
-                                                            em.spread = match k {
-                                                                EmitterKind::Beam => {
-                                                                    if id.is_kerr() { 8.0 } else { 0.45 }
-                                                                }
-                                                                EmitterKind::Point => {
-                                                                    std::f32::consts::PI
-                                                                }
-                                                                EmitterKind::Spot => 0.35,
-                                                                EmitterKind::Disk => 0.85,
-                                                            };
-                                                            actions.photon_edited = true;
-                                                        }
-                                                    }
-                                                });
-
-                                                // Spectrum chips (hidden on Kerr where frequency shift owns color)
-                                                if !id.is_kerr() {
-                                                    ui.horizontal_wrapped(|ui| {
-                                                        let is_white = matches!(
-                                                            em.spectrum,
-                                                            EmitterSpectrum::WhiteFlat
-                                                        );
-                                                        let is_bb = matches!(
-                                                            em.spectrum,
-                                                            EmitterSpectrum::Blackbody(_)
-                                                        );
-                                                        let is_laser = matches!(
-                                                            em.spectrum,
-                                                            EmitterSpectrum::Laser(_)
-                                                        );
-                                                        if mode_chip(ui, "White", is_white)
-                                                            && !is_white
-                                                        {
-                                                            em.spectrum = EmitterSpectrum::WhiteFlat;
-                                                            actions.photon_edited = true;
-                                                        }
-                                                        if mode_chip(ui, "Star / Sun", is_bb)
-                                                            && !is_bb
-                                                        {
-                                                            em.spectrum =
-                                                                EmitterSpectrum::Blackbody(5778.0);
-                                                            actions.photon_edited = true;
-                                                        }
-                                                        if mode_chip(ui, "Laser", is_laser)
-                                                            && !is_laser
-                                                        {
-                                                            em.spectrum =
-                                                                EmitterSpectrum::Laser(532.0);
-                                                            actions.photon_edited = true;
+                                                        if can_del {
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    if ui
+                                                                        .small_button("Delete")
+                                                                        .clicked()
+                                                                    {
+                                                                        del_em = true;
+                                                                    }
+                                                                },
+                                                            );
                                                         }
                                                     });
 
-                                                    match &mut em.spectrum {
-                                                        EmitterSpectrum::Blackbody(temp) => {
-                                                            if labeled_slider(
+                                                    // Shape chips
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        for k in [
+                                                            EmitterKind::Beam,
+                                                            EmitterKind::Point,
+                                                            EmitterKind::Spot,
+                                                            EmitterKind::Disk,
+                                                        ] {
+                                                            if mode_chip(
                                                                 ui,
-                                                                "Temp (K)",
-                                                                temp,
-                                                                2000.0..=15000.0,
-                                                                true,
-                                                            ) {
+                                                                k.label(),
+                                                                em.kind == k,
+                                                            ) && em.kind != k
+                                                            {
+                                                                em.kind = k;
+                                                                em.spread = match k {
+                                                                    EmitterKind::Beam => {
+                                                                        if id.is_kerr() {
+                                                                            8.0
+                                                                        } else {
+                                                                            0.45
+                                                                        }
+                                                                    }
+                                                                    EmitterKind::Point => {
+                                                                        std::f32::consts::PI
+                                                                    }
+                                                                    EmitterKind::Spot => 0.35,
+                                                                    EmitterKind::Disk => 0.85,
+                                                                };
                                                                 actions.photon_edited = true;
                                                             }
                                                         }
-                                                        EmitterSpectrum::Laser(nm) => {
+                                                    });
+
+                                                    // Spectrum chips (hidden on Kerr where frequency shift owns color)
+                                                    if !id.is_kerr() {
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            let is_white = matches!(
+                                                                em.spectrum,
+                                                                EmitterSpectrum::WhiteFlat
+                                                            );
+                                                            let is_bb = matches!(
+                                                                em.spectrum,
+                                                                EmitterSpectrum::Blackbody(_)
+                                                            );
+                                                            let is_laser = matches!(
+                                                                em.spectrum,
+                                                                EmitterSpectrum::Laser(_)
+                                                            );
+                                                            if mode_chip(ui, "White", is_white)
+                                                                && !is_white
+                                                            {
+                                                                em.spectrum =
+                                                                    EmitterSpectrum::WhiteFlat;
+                                                                actions.photon_edited = true;
+                                                            }
+                                                            if mode_chip(ui, "Star / Sun", is_bb)
+                                                                && !is_bb
+                                                            {
+                                                                em.spectrum =
+                                                                    EmitterSpectrum::Blackbody(
+                                                                        5778.0,
+                                                                    );
+                                                                actions.photon_edited = true;
+                                                            }
+                                                            if mode_chip(ui, "Laser", is_laser)
+                                                                && !is_laser
+                                                            {
+                                                                em.spectrum =
+                                                                    EmitterSpectrum::Laser(532.0);
+                                                                actions.photon_edited = true;
+                                                            }
+                                                        });
+
+                                                        match &mut em.spectrum {
+                                                            EmitterSpectrum::Blackbody(temp) => {
+                                                                if labeled_slider(
+                                                                    ui,
+                                                                    "Temp (K)",
+                                                                    temp,
+                                                                    2000.0..=15000.0,
+                                                                    true,
+                                                                ) {
+                                                                    actions.photon_edited = true;
+                                                                }
+                                                            }
+                                                            EmitterSpectrum::Laser(nm) => {
+                                                                if labeled_slider(
+                                                                    ui,
+                                                                    "Color (nm)",
+                                                                    nm,
+                                                                    400.0..=700.0,
+                                                                    false,
+                                                                ) {
+                                                                    actions.photon_edited = true;
+                                                                }
+                                                            }
+                                                            EmitterSpectrum::WhiteFlat => {}
+                                                        }
+                                                    }
+
+                                                    match em.kind {
+                                                        EmitterKind::Beam => {
+                                                            let max_w = if id.is_kerr() {
+                                                                16.0
+                                                            } else {
+                                                                4.8
+                                                            };
                                                             if labeled_slider(
                                                                 ui,
-                                                                "Color (nm)",
-                                                                nm,
-                                                                400.0..=700.0,
+                                                                "Width",
+                                                                &mut em.spread,
+                                                                0.03..=max_w,
                                                                 false,
                                                             ) {
                                                                 actions.photon_edited = true;
                                                             }
                                                         }
-                                                        EmitterSpectrum::WhiteFlat => {}
+                                                        EmitterKind::Spot => {
+                                                            let mut deg = em.spread.to_degrees();
+                                                            if labeled_slider(
+                                                                ui,
+                                                                "Cone",
+                                                                &mut deg,
+                                                                2.0..=170.0,
+                                                                false,
+                                                            ) {
+                                                                em.spread = deg.to_radians();
+                                                                actions.photon_edited = true;
+                                                            }
+                                                        }
+                                                        EmitterKind::Disk => {
+                                                            if labeled_slider(
+                                                                ui,
+                                                                "Radius",
+                                                                &mut em.spread,
+                                                                0.15..=2.5,
+                                                                false,
+                                                            ) {
+                                                                actions.photon_edited = true;
+                                                            }
+                                                        }
+                                                        EmitterKind::Point => {}
                                                     }
-                                                }
 
-                                                match em.kind {
-                                                    EmitterKind::Beam => {
-                                                        let max_w =
-                                                            if id.is_kerr() { 16.0 } else { 4.8 };
-                                                        if labeled_slider(
+                                                    if can_del
+                                                        && labeled_slider(
                                                             ui,
-                                                            "Width",
-                                                            &mut em.spread,
-                                                            0.03..=max_w,
+                                                            "Power",
+                                                            &mut em.power,
+                                                            0.1..=3.0,
                                                             false,
-                                                        ) {
-                                                            actions.photon_edited = true;
-                                                        }
+                                                        )
+                                                    {
+                                                        actions.photon_edited = true;
                                                     }
-                                                    EmitterKind::Spot => {
-                                                        let mut deg = em.spread.to_degrees();
-                                                        if labeled_slider(
-                                                            ui,
-                                                            "Cone",
-                                                            &mut deg,
-                                                            2.0..=170.0,
-                                                            false,
-                                                        ) {
-                                                            em.spread = deg.to_radians();
-                                                            actions.photon_edited = true;
-                                                        }
-                                                    }
-                                                    EmitterKind::Disk => {
-                                                        if labeled_slider(
-                                                            ui,
-                                                            "Radius",
-                                                            &mut em.spread,
-                                                            0.15..=2.5,
-                                                            false,
-                                                        ) {
-                                                            actions.photon_edited = true;
-                                                        }
-                                                    }
-                                                    EmitterKind::Point => {}
-                                                }
+                                                });
 
-                                                if can_del
+                                                if del_em {
+                                                    self.photon_scene.remove_emitter(eidx);
+                                                    self.selection = Selection::Emitter(0);
+                                                    actions.photon_edited = true;
+                                                }
+                                            }
+
+                                            // Physics controls
+                                            subtle_rule(ui);
+                                            section_label(ui, "PHYSICS");
+                                            if id.is_kerr() {
+                                                if labeled_slider(
+                                                    ui,
+                                                    "Kerr Spin a",
+                                                    &mut self.photon_scene.spin,
+                                                    -0.998..=0.998,
+                                                    false,
+                                                ) {
+                                                    actions.photon_edited = true;
+                                                }
+                                            } else {
+                                                if !id.is_solar_system()
                                                     && labeled_slider(
                                                         ui,
-                                                        "Power",
-                                                        &mut em.power,
-                                                        0.1..=3.0,
+                                                        "Dispersion",
+                                                        &mut self.photon_scene.dispersion_scale,
+                                                        0.0..=3.0,
+                                                        false,
+                                                    )
+                                                {
+                                                    actions.photon_edited = true;
+                                                    actions.photon_reupload = id.is_optics();
+                                                }
+                                                if id.is_grin()
+                                                    && labeled_slider(
+                                                        ui,
+                                                        "Strength",
+                                                        &mut self.photon_scene.grin_strength,
+                                                        0.25..=2.2,
                                                         false,
                                                     )
                                                 {
                                                     actions.photon_edited = true;
                                                 }
-                                            });
-
-                                            if del_em {
-                                                self.photon_scene.remove_emitter(eidx);
-                                                self.selection = Selection::Emitter(0);
-                                                actions.photon_edited = true;
                                             }
-                                        }
 
-                                        // Physics controls
-                                        subtle_rule(ui);
-                                        section_label(ui, "PHYSICS");
-                                        if id.is_kerr() {
                                             if labeled_slider(
                                                 ui,
-                                                "Kerr Spin a",
-                                                &mut self.photon_scene.spin,
-                                                -0.998..=0.998,
-                                                false,
+                                                "Exposure",
+                                                &mut self.photon_settings.exposure,
+                                                0.15..=4.0,
+                                                true,
                                             ) {
                                                 actions.photon_edited = true;
                                             }
-                                        } else {
-                                            if !id.is_solar_system()
-                                                && labeled_slider(
-                                                    ui,
-                                                    "Dispersion",
-                                                    &mut self.photon_scene.dispersion_scale,
-                                                    0.0..=3.0,
-                                                    false,
-                                                )
-                                            {
-                                                actions.photon_edited = true;
-                                                actions.photon_reupload = id.is_optics();
-                                            }
-                                            if id.is_grin()
-                                                && labeled_slider(
-                                                    ui,
-                                                    "Strength",
-                                                    &mut self.photon_scene.grin_strength,
-                                                    0.25..=2.2,
-                                                    false,
-                                                )
-                                            {
-                                                actions.photon_edited = true;
-                                            }
-                                        }
 
-                                        if labeled_slider(
-                                            ui,
-                                            "Exposure",
-                                            &mut self.photon_settings.exposure,
-                                            0.15..=4.0,
-                                            true,
-                                        ) {
-                                            actions.photon_edited = true;
-                                        }
-
-                                        // Interactive Playground / Optical Bench
-                                        if id.is_optics() {
-                                            subtle_rule(ui);
-                                            section_label(ui, "OBJECTS");
-                                            ui.horizontal_wrapped(|ui| {
-                                                let c = self.photon_scene.view_center;
-                                                if ui.small_button("+ Prism").clicked() {
-                                                    let idx = self.photon_scene.add_element(
-                                                        "Prism",
-                                                        ElementKind::Prism { radius: 1.8 },
-                                                        c,
-                                                        0.0,
-                                                        GlassMaterial::StudioFlint,
-                                                    );
-                                                    self.selection = Selection::Element(idx);
-                                                    actions.photon_reupload = true;
-                                                    actions.photon_edited = true;
-                                                }
-                                                if ui.small_button("+ Lens").clicked() {
-                                                    let idx = self.photon_scene.add_element(
-                                                        "Lens",
-                                                        ElementKind::Lens {
-                                                            radius: 3.4,
-                                                            half_offset: 2.4,
-                                                        },
-                                                        c,
-                                                        0.0,
-                                                        GlassMaterial::CrownBk7,
-                                                    );
-                                                    self.selection = Selection::Element(idx);
-                                                    actions.photon_reupload = true;
-                                                    actions.photon_edited = true;
-                                                }
-                                                if ui.small_button("+ Mirror").clicked() {
-                                                    let idx = self.photon_scene.add_element(
-                                                        "Mirror",
-                                                        ElementKind::FlatMirror { half_len: 1.8 },
-                                                        c,
-                                                        0.35,
-                                                        GlassMaterial::CrownBk7,
-                                                    );
-                                                    self.selection = Selection::Element(idx);
-                                                    actions.photon_reupload = true;
-                                                    actions.photon_edited = true;
-                                                }
-                                                if ui.small_button("+ Arc").clicked() {
-                                                    let idx = self.photon_scene.add_element(
-                                                        "Curved Mirror",
-                                                        ElementKind::CurvedMirror {
-                                                            radius: 3.2,
-                                                            arc_half_angle: 0.75,
-                                                        },
-                                                        [c[0] - 2.0, c[1]],
-                                                        0.0,
-                                                        GlassMaterial::CrownBk7,
-                                                    );
-                                                    self.selection = Selection::Element(idx);
-                                                    actions.photon_reupload = true;
-                                                    actions.photon_edited = true;
-                                                }
-                                                if ui.small_button("+ Splitter").clicked() {
-                                                    let idx = self.photon_scene.add_element(
-                                                        "Beam Splitter",
-                                                        ElementKind::BeamSplitter { half_len: 1.8 },
-                                                        c,
-                                                        0.785,
-                                                        GlassMaterial::CrownBk7,
-                                                    );
-                                                    self.selection = Selection::Element(idx);
-                                                    actions.photon_reupload = true;
-                                                    actions.photon_edited = true;
-                                                }
-                                                if ui.small_button("+ Wall").clicked() {
-                                                    let idx = self.photon_scene.add_element(
-                                                        "Matte Wall",
-                                                        ElementKind::MatteWall {
-                                                            half_len: 2.0,
-                                                            color: [0.85, 0.85, 0.88],
-                                                        },
-                                                        [c[0] + 2.5, c[1]],
-                                                        0.0,
-                                                        GlassMaterial::CrownBk7,
-                                                    );
-                                                    self.selection = Selection::Element(idx);
-                                                    actions.photon_reupload = true;
-                                                    actions.photon_edited = true;
-                                                }
-                                                if ui.small_button("+ Planet").clicked() {
-                                                    let idx = self.photon_scene.add_element(
-                                                        "Planet",
-                                                        ElementKind::Planet {
-                                                            radius: 0.75,
-                                                            albedo: [0.32, 0.55, 0.80],
-                                                            atmo_thickness: 0.45,
-                                                            atmo_density: 2.0,
-                                                            ring_outer: 0.0,
-                                                            orbit_radius: 0.0,
-                                                            orbit_speed: 0.0,
-                                                            orbit_phase: 0.0,
-                                                            parent_idx: None,
-                                                        },
-                                                        [c[0] + 1.5, c[1]],
-                                                        0.0,
-                                                        GlassMaterial::CrownBk7,
-                                                    );
-                                                    self.selection = Selection::Element(idx);
-                                                    actions.photon_reupload = true;
-                                                    actions.photon_edited = true;
-                                                }
-                                                if ui.small_button("+ Stop").clicked() {
-                                                    let idx = self.photon_scene.add_element(
-                                                        "Beam Stop",
-                                                        ElementKind::Absorber { half_len: 1.4 },
-                                                        c,
-                                                        0.0,
-                                                        GlassMaterial::CrownBk7,
-                                                    );
-                                                    self.selection = Selection::Element(idx);
-                                                    actions.photon_reupload = true;
-                                                    actions.photon_edited = true;
-                                                }
-                                                if !self.photon_scene.elements.is_empty()
-                                                    && ui.small_button("Clear").clicked()
-                                                {
-                                                    self.photon_scene.clear_elements();
-                                                    self.selection = Selection::Emitter(0);
-                                                    actions.photon_reupload = true;
-                                                    actions.photon_edited = true;
-                                                }
-                                            });
-
-                                            // Selected object inspector card
-                                            if let Selection::Element(idx) = self.selection
-                                                && idx < self.photon_scene.elements.len()
-                                            {
-                                                let mut delete_it = false;
-                                                let el_name = self.photon_scene.elements[idx].name;
-                                                let is_glass =
-                                                    self.photon_scene.elements[idx].kind.is_glass();
-
-                                                card_frame().show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(
-                                                            RichText::new(el_name)
-                                                                .strong()
-                                                                .size(11.5)
-                                                                .color(Color32::from_rgb(
-                                                                    224, 234, 248,
-                                                                )),
+                                            // Interactive Playground / Optical Bench
+                                            if id.is_optics() {
+                                                subtle_rule(ui);
+                                                section_label(ui, "OBJECTS");
+                                                ui.horizontal_wrapped(|ui| {
+                                                    let c = self.photon_scene.view_center;
+                                                    if ui.small_button("+ Prism").clicked() {
+                                                        let idx = self.photon_scene.add_element(
+                                                            "Prism",
+                                                            ElementKind::Prism { radius: 1.8 },
+                                                            c,
+                                                            0.0,
+                                                            GlassMaterial::StudioFlint,
                                                         );
-                                                        ui.with_layout(
-                                                            egui::Layout::right_to_left(
-                                                                egui::Align::Center,
-                                                            ),
-                                                            |ui| {
-                                                                if ui.small_button("Delete").clicked()
-                                                                {
-                                                                    delete_it = true;
-                                                                }
-                                                            },
-                                                        );
-                                                    });
-
-                                                    if is_glass {
-                                                        ui.horizontal_wrapped(|ui| {
-                                                            for mat in GlassMaterial::ALL {
-                                                                let sel =
-                                                                    self.photon_scene.elements[idx]
-                                                                        .material
-                                                                        == mat;
-                                                                if mode_chip(ui, mat.label(), sel) {
-                                                                    self.photon_scene.elements[idx]
-                                                                        .material = mat;
-                                                                    actions.photon_reupload = true;
-                                                                    actions.photon_edited = true;
-                                                                }
-                                                            }
-                                                        });
-                                                    }
-
-                                                    match &mut self.photon_scene.elements[idx].kind {
-                                                        ElementKind::Planet {
-                                                            albedo,
-                                                            atmo_thickness,
-                                                            atmo_density,
-                                                            ring_outer,
-                                                            radius,
-                                                            ..
-                                                        } => {
-                                                            ui.horizontal_wrapped(|ui| {
-                                                                for (lbl, col, atmo_t, atmo_d) in [
-                                                                    ("Earth", [0.30, 0.52, 0.78], 0.48, 2.1),
-                                                                    ("Mars", [0.84, 0.36, 0.22], 0.24, 0.65),
-                                                                    ("Venus", [0.88, 0.78, 0.54], 0.42, 2.2),
-                                                                    ("Moon", [0.68, 0.67, 0.64], 0.0, 0.0),
-                                                                ] {
-                                                                    if ui.small_button(lbl).clicked() {
-                                                                        *albedo = col;
-                                                                        *atmo_thickness = atmo_t;
-                                                                        *atmo_density = atmo_d;
-                                                                        actions.photon_reupload = true;
-                                                                        actions.photon_edited = true;
-                                                                    }
-                                                                }
-                                                            });
-                                                            if labeled_slider(
-                                                                ui,
-                                                                "Atmosphere",
-                                                                atmo_density,
-                                                                0.0..=3.5,
-                                                                false,
-                                                            ) {
-                                                                if *atmo_density > 0.02
-                                                                    && *atmo_thickness < 0.1
-                                                                {
-                                                                    *atmo_thickness = 0.45;
-                                                                }
-                                                                actions.photon_reupload = true;
-                                                                actions.photon_edited = true;
-                                                            }
-                                                            let mut has_ring =
-                                                                *ring_outer > *radius * 1.15;
-                                                            if ui.checkbox(&mut has_ring, "Icy Rings").changed() {
-                                                                *ring_outer = if has_ring {
-                                                                    *radius * 2.15
-                                                                } else {
-                                                                    0.0
-                                                                };
-                                                                actions.photon_reupload = true;
-                                                                actions.photon_edited = true;
-                                                            }
-                                                        }
-                                                        ElementKind::MatteWall { color, .. } => {
-                                                            ui.horizontal_wrapped(|ui| {
-                                                                for (lbl, col) in [
-                                                                    ("White", [0.88, 0.88, 0.90]),
-                                                                    ("Red", [0.88, 0.20, 0.16]),
-                                                                    ("Green", [0.20, 0.82, 0.28]),
-                                                                    ("Blue", [0.20, 0.44, 0.90]),
-                                                                    ("Gold", [0.92, 0.72, 0.22]),
-                                                                ] {
-                                                                    if ui.small_button(lbl).clicked() {
-                                                                        *color = col;
-                                                                        actions.photon_reupload = true;
-                                                                        actions.photon_edited = true;
-                                                                    }
-                                                                }
-                                                            });
-                                                        }
-                                                        _ => {}
-                                                    }
-
-                                                    let mut deg = self.photon_scene.elements[idx]
-                                                        .angle
-                                                        .to_degrees()
-                                                        .rem_euclid(360.0);
-                                                    if deg > 180.0 {
-                                                        deg -= 360.0;
-                                                    }
-                                                    if labeled_slider(
-                                                        ui,
-                                                        "Angle",
-                                                        &mut deg,
-                                                        -180.0..=180.0,
-                                                        false,
-                                                    ) {
-                                                        self.photon_scene.elements[idx].angle =
-                                                            deg.to_radians();
+                                                        self.selection = Selection::Element(idx);
                                                         actions.photon_reupload = true;
                                                         actions.photon_edited = true;
                                                     }
-
-                                                    let mut sz =
-                                                        self.photon_scene.elements[idx].kind.size();
-                                                    if labeled_slider(
-                                                        ui,
-                                                        "Size",
-                                                        &mut sz,
-                                                        0.2..=6.5,
-                                                        false,
-                                                    ) {
-                                                        self.photon_scene.elements[idx]
-                                                            .kind
-                                                            .set_size(sz);
+                                                    if ui.small_button("+ Lens").clicked() {
+                                                        let idx = self.photon_scene.add_element(
+                                                            "Lens",
+                                                            ElementKind::Lens {
+                                                                radius: 3.4,
+                                                                half_offset: 2.4,
+                                                            },
+                                                            c,
+                                                            0.0,
+                                                            GlassMaterial::CrownBk7,
+                                                        );
+                                                        self.selection = Selection::Element(idx);
+                                                        actions.photon_reupload = true;
+                                                        actions.photon_edited = true;
+                                                    }
+                                                    if ui.small_button("+ Mirror").clicked() {
+                                                        let idx = self.photon_scene.add_element(
+                                                            "Mirror",
+                                                            ElementKind::FlatMirror {
+                                                                half_len: 1.8,
+                                                            },
+                                                            c,
+                                                            0.35,
+                                                            GlassMaterial::CrownBk7,
+                                                        );
+                                                        self.selection = Selection::Element(idx);
+                                                        actions.photon_reupload = true;
+                                                        actions.photon_edited = true;
+                                                    }
+                                                    if ui.small_button("+ Arc").clicked() {
+                                                        let idx = self.photon_scene.add_element(
+                                                            "Curved Mirror",
+                                                            ElementKind::CurvedMirror {
+                                                                radius: 3.2,
+                                                                arc_half_angle: 0.75,
+                                                            },
+                                                            [c[0] - 2.0, c[1]],
+                                                            0.0,
+                                                            GlassMaterial::CrownBk7,
+                                                        );
+                                                        self.selection = Selection::Element(idx);
+                                                        actions.photon_reupload = true;
+                                                        actions.photon_edited = true;
+                                                    }
+                                                    if ui.small_button("+ Splitter").clicked() {
+                                                        let idx = self.photon_scene.add_element(
+                                                            "Beam Splitter",
+                                                            ElementKind::BeamSplitter {
+                                                                half_len: 1.8,
+                                                            },
+                                                            c,
+                                                            0.785,
+                                                            GlassMaterial::CrownBk7,
+                                                        );
+                                                        self.selection = Selection::Element(idx);
+                                                        actions.photon_reupload = true;
+                                                        actions.photon_edited = true;
+                                                    }
+                                                    if ui.small_button("+ Wall").clicked() {
+                                                        let idx = self.photon_scene.add_element(
+                                                            "Matte Wall",
+                                                            ElementKind::MatteWall {
+                                                                half_len: 2.0,
+                                                                color: [0.85, 0.85, 0.88],
+                                                            },
+                                                            [c[0] + 2.5, c[1]],
+                                                            0.0,
+                                                            GlassMaterial::CrownBk7,
+                                                        );
+                                                        self.selection = Selection::Element(idx);
+                                                        actions.photon_reupload = true;
+                                                        actions.photon_edited = true;
+                                                    }
+                                                    if ui.small_button("+ Planet").clicked() {
+                                                        let idx = self.photon_scene.add_element(
+                                                            "Planet",
+                                                            ElementKind::Planet {
+                                                                radius: 0.75,
+                                                                albedo: [0.32, 0.55, 0.80],
+                                                                atmo_thickness: 0.45,
+                                                                atmo_density: 2.0,
+                                                                ring_outer: 0.0,
+                                                                orbit_radius: 0.0,
+                                                                orbit_speed: 0.0,
+                                                                orbit_phase: 0.0,
+                                                                parent_idx: None,
+                                                            },
+                                                            [c[0] + 1.5, c[1]],
+                                                            0.0,
+                                                            GlassMaterial::CrownBk7,
+                                                        );
+                                                        self.selection = Selection::Element(idx);
+                                                        actions.photon_reupload = true;
+                                                        actions.photon_edited = true;
+                                                    }
+                                                    if ui.small_button("+ Stop").clicked() {
+                                                        let idx = self.photon_scene.add_element(
+                                                            "Beam Stop",
+                                                            ElementKind::Absorber { half_len: 1.4 },
+                                                            c,
+                                                            0.0,
+                                                            GlassMaterial::CrownBk7,
+                                                        );
+                                                        self.selection = Selection::Element(idx);
+                                                        actions.photon_reupload = true;
+                                                        actions.photon_edited = true;
+                                                    }
+                                                    if !self.photon_scene.elements.is_empty()
+                                                        && ui.small_button("Clear").clicked()
+                                                    {
+                                                        self.photon_scene.clear_elements();
+                                                        self.selection = Selection::Emitter(0);
                                                         actions.photon_reupload = true;
                                                         actions.photon_edited = true;
                                                     }
                                                 });
 
-                                                if delete_it {
-                                                    self.photon_scene.remove_element(idx);
-                                                    self.selection = Selection::Emitter(0);
-                                                    actions.photon_reupload = true;
-                                                    actions.photon_edited = true;
+                                                // Selected object inspector card
+                                                if let Selection::Element(idx) = self.selection
+                                                    && idx < self.photon_scene.elements.len()
+                                                {
+                                                    let mut delete_it = false;
+                                                    let el_name =
+                                                        self.photon_scene.elements[idx].name;
+                                                    let is_glass = self.photon_scene.elements[idx]
+                                                        .kind
+                                                        .is_glass();
+
+                                                    card_frame().show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(
+                                                                RichText::new(el_name)
+                                                                    .strong()
+                                                                    .size(11.5)
+                                                                    .color(Color32::from_rgb(
+                                                                        224, 234, 248,
+                                                                    )),
+                                                            );
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    if ui
+                                                                        .small_button("Delete")
+                                                                        .clicked()
+                                                                    {
+                                                                        delete_it = true;
+                                                                    }
+                                                                },
+                                                            );
+                                                        });
+
+                                                        if is_glass {
+                                                            ui.horizontal_wrapped(|ui| {
+                                                                for mat in GlassMaterial::ALL {
+                                                                    let sel = self
+                                                                        .photon_scene
+                                                                        .elements[idx]
+                                                                        .material
+                                                                        == mat;
+                                                                    if mode_chip(
+                                                                        ui,
+                                                                        mat.label(),
+                                                                        sel,
+                                                                    ) {
+                                                                        self.photon_scene
+                                                                            .elements[idx]
+                                                                            .material = mat;
+                                                                        actions.photon_reupload =
+                                                                            true;
+                                                                        actions.photon_edited =
+                                                                            true;
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+
+                                                        match &mut self.photon_scene.elements[idx]
+                                                            .kind
+                                                        {
+                                                            ElementKind::Planet {
+                                                                albedo,
+                                                                atmo_thickness,
+                                                                atmo_density,
+                                                                ring_outer,
+                                                                radius,
+                                                                ..
+                                                            } => {
+                                                                ui.horizontal_wrapped(|ui| {
+                                                                    for (
+                                                                        lbl,
+                                                                        col,
+                                                                        atmo_t,
+                                                                        atmo_d,
+                                                                    ) in [
+                                                                        (
+                                                                            "Earth",
+                                                                            [0.30, 0.52, 0.78],
+                                                                            0.48,
+                                                                            2.1,
+                                                                        ),
+                                                                        (
+                                                                            "Mars",
+                                                                            [0.84, 0.36, 0.22],
+                                                                            0.24,
+                                                                            0.65,
+                                                                        ),
+                                                                        (
+                                                                            "Venus",
+                                                                            [0.88, 0.78, 0.54],
+                                                                            0.42,
+                                                                            2.2,
+                                                                        ),
+                                                                        (
+                                                                            "Moon",
+                                                                            [0.68, 0.67, 0.64],
+                                                                            0.0,
+                                                                            0.0,
+                                                                        ),
+                                                                    ] {
+                                                                        if ui
+                                                                            .small_button(lbl)
+                                                                            .clicked()
+                                                                        {
+                                                                            *albedo = col;
+                                                                            *atmo_thickness =
+                                                                                atmo_t;
+                                                                            *atmo_density = atmo_d;
+                                                                            actions
+                                                                                .photon_reupload =
+                                                                                true;
+                                                                            actions.photon_edited =
+                                                                                true;
+                                                                        }
+                                                                    }
+                                                                });
+                                                                if labeled_slider(
+                                                                    ui,
+                                                                    "Atmosphere",
+                                                                    atmo_density,
+                                                                    0.0..=3.5,
+                                                                    false,
+                                                                ) {
+                                                                    if *atmo_density > 0.02
+                                                                        && *atmo_thickness < 0.1
+                                                                    {
+                                                                        *atmo_thickness = 0.45;
+                                                                    }
+                                                                    actions.photon_reupload = true;
+                                                                    actions.photon_edited = true;
+                                                                }
+                                                                let mut has_ring =
+                                                                    *ring_outer > *radius * 1.15;
+                                                                if ui
+                                                                    .checkbox(
+                                                                        &mut has_ring,
+                                                                        "Icy Rings",
+                                                                    )
+                                                                    .changed()
+                                                                {
+                                                                    *ring_outer = if has_ring {
+                                                                        *radius * 2.15
+                                                                    } else {
+                                                                        0.0
+                                                                    };
+                                                                    actions.photon_reupload = true;
+                                                                    actions.photon_edited = true;
+                                                                }
+                                                            }
+                                                            ElementKind::MatteWall {
+                                                                color,
+                                                                ..
+                                                            } => {
+                                                                ui.horizontal_wrapped(|ui| {
+                                                                    for (lbl, col) in [
+                                                                        (
+                                                                            "White",
+                                                                            [0.88, 0.88, 0.90],
+                                                                        ),
+                                                                        ("Red", [0.88, 0.20, 0.16]),
+                                                                        (
+                                                                            "Green",
+                                                                            [0.20, 0.82, 0.28],
+                                                                        ),
+                                                                        (
+                                                                            "Blue",
+                                                                            [0.20, 0.44, 0.90],
+                                                                        ),
+                                                                        (
+                                                                            "Gold",
+                                                                            [0.92, 0.72, 0.22],
+                                                                        ),
+                                                                    ] {
+                                                                        if ui
+                                                                            .small_button(lbl)
+                                                                            .clicked()
+                                                                        {
+                                                                            *color = col;
+                                                                            actions
+                                                                                .photon_reupload =
+                                                                                true;
+                                                                            actions.photon_edited =
+                                                                                true;
+                                                                        }
+                                                                    }
+                                                                });
+                                                            }
+                                                            _ => {}
+                                                        }
+
+                                                        let mut deg = self.photon_scene.elements
+                                                            [idx]
+                                                            .angle
+                                                            .to_degrees()
+                                                            .rem_euclid(360.0);
+                                                        if deg > 180.0 {
+                                                            deg -= 360.0;
+                                                        }
+                                                        if labeled_slider(
+                                                            ui,
+                                                            "Angle",
+                                                            &mut deg,
+                                                            -180.0..=180.0,
+                                                            false,
+                                                        ) {
+                                                            self.photon_scene.elements[idx].angle =
+                                                                deg.to_radians();
+                                                            actions.photon_reupload = true;
+                                                            actions.photon_edited = true;
+                                                        }
+
+                                                        let mut sz = self.photon_scene.elements
+                                                            [idx]
+                                                            .kind
+                                                            .size();
+                                                        if labeled_slider(
+                                                            ui,
+                                                            "Size",
+                                                            &mut sz,
+                                                            0.2..=6.5,
+                                                            false,
+                                                        ) {
+                                                            self.photon_scene.elements[idx]
+                                                                .kind
+                                                                .set_size(sz);
+                                                            actions.photon_reupload = true;
+                                                            actions.photon_edited = true;
+                                                        }
+                                                    });
+
+                                                    if delete_it {
+                                                        self.photon_scene.remove_element(idx);
+                                                        self.selection = Selection::Emitter(0);
+                                                        actions.photon_reupload = true;
+                                                        actions.photon_edited = true;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1498,7 +1935,7 @@ impl StudioApp {
         let hint_text = match self.mode {
             StudioMode::BlackHole3D => "LMB Orbit · Scroll Zoom · H Hide UI",
             StudioMode::Photons(PhotonSceneId::SolarSystem) => {
-                "P Pause Orbits · M Wavefront · LMB Drag Planet/Sun · Scroll Zoom · H Hide UI"
+                "Click Body Focus · LMB Pan · Scroll Zoom · P Pause · M Wavefront · H Hide UI"
             }
             StudioMode::Photons(id) if id.is_optics() => {
                 "LMB Drag Emitter / Object · Shift+LMB Rotate · RMB Aim · Scroll Zoom · H Hide UI"
@@ -1557,18 +1994,13 @@ impl StudioApp {
             self.smoothed_fps = 1000.0 / self.smoothed_ms.max(0.1);
         }
 
-        // Advance Solar System orbital animation when running.
+        // Advance true-ratio f64 Keplerian Solar System orbital clock when running.
         if matches!(self.mode, StudioMode::Photons(PhotonSceneId::SolarSystem))
             && !self.orbit_paused
             && self.drag.is_none()
-            && self.photon_scene.step_orbits(dt_sec)
-            && let Some(gfx) = &mut self.gfx
+            && self.photon_scene.solar.step_time(f64::from(dt_sec))
         {
-            gfx.photon_pipeline
-                .upload_scene(&gfx.gpu, &self.photon_scene);
-            if self.photon_settings.mode == PhotonMode::Accumulate {
-                gfx.photon_pipeline.blend_accumulation();
-            }
+            self.sync_solar_scene(false, true);
         }
 
         if self.mode == StudioMode::BlackHole3D
@@ -1618,6 +2050,10 @@ impl StudioApp {
         }
         if ui_actions.bh_shade_dirty {
             self.bh_shade_dirty = true;
+        }
+        if ui_actions.solar_changed {
+            self.sync_solar_scene(true, false);
+            self.photon_last_edit = Instant::now();
         }
         if ui_actions.photon_reset_accum
             && let Some(gfx) = &mut self.gfx
@@ -1790,6 +2226,7 @@ struct UiActions {
     switch_mode: Option<StudioMode>,
     bh_trace_dirty: bool,
     bh_shade_dirty: bool,
+    solar_changed: bool,
     photon_edited: bool,
     photon_reupload: bool,
     photon_reset_accum: bool,
@@ -1851,6 +2288,10 @@ impl ApplicationHandler for StudioApp {
             };
             surface.configure(&gpu.device, &surface_config);
 
+            if self.photon_scene.id.is_solar_system() {
+                self.photon_scene
+                    .sync_solar_to_gpu(f64::from(w) / f64::from(h));
+            }
             let bh_pipeline = BlackHolePipeline::new(&gpu, w, h, format);
             let mut photon_pipeline =
                 PhotonPipeline::new(&gpu, w, h, self.photon_settings.num_photons, format);
@@ -1912,6 +2353,7 @@ impl ApplicationHandler for StudioApp {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::Resized(new_size) => {
+                let mut resized_solar = false;
                 if let Some(gfx) = &mut self.gfx
                     && new_size.width > 0
                     && new_size.height > 0
@@ -1921,6 +2363,10 @@ impl ApplicationHandler for StudioApp {
                     gfx.surface.configure(&gfx.gpu.device, &gfx.surface_config);
                     self.bh_trace_dirty = true;
                     self.bh_full_res = true;
+                    resized_solar = self.photon_scene.id.is_solar_system();
+                }
+                if resized_solar {
+                    self.sync_solar_scene(true, false);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -1936,6 +2382,44 @@ impl ApplicationHandler for StudioApp {
                     (StudioMode::BlackHole3D, MouseButton::Left) => {
                         self.drag = Some(CanvasDrag::Orbit3D);
                     }
+                    (StudioMode::Photons(PhotonSceneId::SolarSystem), MouseButton::Left) => {
+                        // Click a planet/moon reticle to focus onto it, or drag anywhere to pan in f64 AU.
+                        let mut clicked_body: Option<usize> = None;
+                        if let Some((cx, cy)) = self.last_cursor
+                            && let Some(gfx) = &self.gfx
+                            && let Some(sf) = &self.photon_scene.last_solar_frame
+                        {
+                            let w = f64::from(gfx.surface_config.width.max(1));
+                            let h = f64::from(gfx.surface_config.height.max(1));
+                            let aspect = w / h;
+                            let inv_s = 1.0 / sf.view_half_height_au.max(1e-9);
+                            let mut best_d = 18.0_f64;
+                            for (i, b) in self.photon_scene.solar.bodies.iter().enumerate() {
+                                if b.parent.is_some()
+                                    && (b.semi_major_au * inv_s) * (h * 0.5) < 14.0
+                                {
+                                    continue;
+                                }
+                                let gp = sf.body_gpu_pos[i];
+                                let bx = (gp[0] / aspect * 0.5 + 0.5) * w;
+                                let by = (0.5 - gp[1] * 0.5) * h;
+                                let d = ((cx - bx).powi(2) + (cy - by).powi(2)).sqrt();
+                                let pick = (sf.body_gpu_rad[i] * h * 0.5).max(16.0);
+                                if d <= pick && d < best_d.max(pick) {
+                                    best_d = d;
+                                    clicked_body = Some(i);
+                                }
+                            }
+                        }
+                        if let Some(idx) = clicked_body {
+                            self.photon_scene.solar.set_focus(SolarFocus::Body(idx));
+                            self.sync_solar_scene(true, false);
+                            self.photon_last_edit = Instant::now();
+                        } else {
+                            self.drag = Some(CanvasDrag::SolarPan);
+                        }
+                    }
+                    (StudioMode::Photons(PhotonSceneId::SolarSystem), MouseButton::Right) => {}
                     (StudioMode::Photons(id), MouseButton::Left) => {
                         if let Some((cx, cy)) = self.last_cursor
                             && let Some(world) = self.cursor_to_world(cx, cy)
@@ -2014,6 +2498,20 @@ impl ApplicationHandler for StudioApp {
                             self.bh_trace_dirty = true;
                             self.bh_full_res = false;
                             self.bh_last_input = Instant::now();
+                        }
+                    }
+                    CanvasDrag::SolarPan => {
+                        if let Some((px, py)) = prev
+                            && let Some(gfx) = &self.gfx
+                        {
+                            let h = f64::from(gfx.surface_config.height.max(1));
+                            let au_per_px = (2.0 * self.photon_scene.solar.view_half_height_au) / h;
+                            self.photon_scene.solar.pan_offset_au[0] -=
+                                (position.x - px) * au_per_px;
+                            self.photon_scene.solar.pan_offset_au[1] +=
+                                (position.y - py) * au_per_px;
+                            self.sync_solar_scene(true, false);
+                            self.photon_last_edit = Instant::now();
                         }
                     }
                     CanvasDrag::EmitterMove { idx } => {
@@ -2097,6 +2595,15 @@ impl ApplicationHandler for StudioApp {
                         self.bh_trace_dirty = true;
                         self.bh_full_res = false;
                         self.bh_last_input = Instant::now();
+                    }
+                    StudioMode::Photons(PhotonSceneId::SolarSystem) => {
+                        // Seamless floating-origin zoom across >6 orders of magnitude (45 AU down to ~7,500 km!).
+                        let factor = (-f64::from(scroll) * 0.14).exp();
+                        self.photon_scene.solar.view_half_height_au =
+                            (self.photon_scene.solar.view_half_height_au * factor)
+                                .clamp(0.000_025, 45.0);
+                        self.sync_solar_scene(true, false);
+                        self.photon_last_edit = Instant::now();
                     }
                     StudioMode::Photons(_) => {
                         self.photon_scene.view_half_height = (self.photon_scene.view_half_height

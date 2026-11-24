@@ -145,16 +145,18 @@ fn scene_overlay(world: vec2<f32>, px_world: f32) -> vec3<f32> {
         let em = emitters[i];
         if (em.info.x == EMITTER_DISK) {
             let r = length(world - em.geom.xy);
-            let rad = max(em.geom.w, 0.05);
+            let true_rad = max(em.geom.w, 1e-6);
+            let vis_rad = max(true_rad, px_world * 2.5);
             let tint = select(vec3<f32>(1.0, 0.96, 0.88), star_color_tint(em.spec.x), em.info.y == SPEC_BLACKBODY);
-            if (r <= rad) {
-                let mu = sqrt(max(1.0 - (r * r) / (rad * rad), 0.0));
+            if (r <= vis_rad) {
+                let mu = sqrt(max(1.0 - (r * r) / (vis_rad * vis_rad), 0.0));
                 // Subtle physical limb darkening across the solar photosphere.
                 let limb = 0.45 + 0.55 * mu;
                 col = col + tint * (3.8 * limb);
             } else {
-                let d = r - rad;
-                col = col + tint * (0.45 * exp(-d / (rad * 0.28)));
+                let d = r - vis_rad;
+                let halo_w = max(true_rad * 0.28, px_world * 10.0);
+                col = col + tint * (0.45 * exp(-d / halo_w));
             }
         }
     }
@@ -208,11 +210,11 @@ fn scene_overlay(world: vec2<f32>, px_world: f32) -> vec3<f32> {
         if (cir.info.x == MAT_DIFFUSE) {
             // Subtle shaded planet silhouette + rim.
             if (len < radius) {
-                col = col + cir.material.xyz * 0.025;
+                col = col + cir.material.xyz * 0.055;
             }
-            col = col + (cir.material.xyz * 0.22 + vec3<f32>(0.04)) * alpha;
+            col = col + (cir.material.xyz * 0.28 + vec3<f32>(0.04)) * alpha;
         } else if (cir.info.x == MAT_ATMOSPHERE) {
-            col = col + vec3<f32>(0.03, 0.07, 0.14) * alpha;
+            col = col + vec3<f32>(0.012, 0.032, 0.075) * alpha;
         } else {
             let tint = select(vec3<f32>(0.08, 0.16, 0.24), vec3<f32>(0.28, 0.32, 0.38), cir.info.x == MAT_MIRROR);
             col = col + tint * alpha;
@@ -246,7 +248,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (u.counts.z == 2u) {
         // Temporal EMA for smoothly orbiting / animated Steady scenes (zero speckle, zero lag).
         let prev_avg = acc_xyz * u.params.w;
-        acc_xyz = mix(prev_avg, frame_xyz, 0.14);
+        acc_xyz = mix(prev_avg, frame_xyz, 0.06);
     } else if (u.dims.w == 0u) {
         acc_xyz = acc_xyz + frame_xyz;
     } else {
