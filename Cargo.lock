@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "caustic-app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "caustic-blackhole",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "caustic-blackhole"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "caustic-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "caustic-photons"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytemuck",

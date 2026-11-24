@@ -11,7 +11,9 @@ use caustic_core::spectrum::build_spectral_xyz_lut;
 use wgpu::util::DeviceExt;
 
 use crate::ingoing_kerr::r_plus;
-use crate::scene::{OptCircle, OptSegment, PhotonMode, PhotonScene, PhysicsKind};
+use crate::scene::{
+    GpuEmitter, MAX_EMITTERS, OptCircle, OptSegment, PhotonMode, PhotonScene, PhysicsKind,
+};
 
 /// Maximum segments / circles supported in scene storage buffers.
 const MAX_SEGMENTS: usize = 128;
@@ -136,11 +138,13 @@ pub struct PhotonPipeline {
     spectral_lut_buf: wgpu::Buffer,
     segments_buf: wgpu::Buffer,
     circles_buf: wgpu::Buffer,
+    emitters_buf: wgpu::Buffer,
     sized: SizedBuffers,
     timers: Option<GpuTimers>,
     frame_idx: u32,
     accum_frames: u64,
-    pending_clear: bool,
+    /// `0` = normal accumulate/pulse, `1` = hard clear, `2` = temporal EMA blend (smooth live animation).
+    pending_clear_mode: u32,
     pending_pulse: bool,
 }
 
@@ -179,6 +183,7 @@ impl PhotonPipeline {
                     bgl_buf(3, wgpu::BufferBindingType::Storage { read_only: true }),
                     bgl_buf(4, wgpu::BufferBindingType::Storage { read_only: true }),
                     bgl_buf(5, wgpu::BufferBindingType::Storage { read_only: true }),
+                    bgl_buf(6, wgpu::BufferBindingType::Storage { read_only: true }),
                 ],
             });
 
@@ -202,6 +207,7 @@ impl PhotonPipeline {
                     },
                     bgl_buf(4, wgpu::BufferBindingType::Storage { read_only: true }),
                     bgl_buf(5, wgpu::BufferBindingType::Storage { read_only: true }),
+                    bgl_buf(6, wgpu::BufferBindingType::Storage { read_only: true }),
                 ],
             });
 
@@ -285,6 +291,12 @@ impl PhotonPipeline {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let emitters_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("photon-emitters"),
+            size: (MAX_EMITTERS * std::mem::size_of::<GpuEmitter>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let sized = Self::create_sized(
             gpu,
@@ -299,6 +311,7 @@ impl PhotonPipeline {
             &spectral_lut_buf,
             &segments_buf,
             &circles_buf,
+            &emitters_buf,
         );
         let timers = GpuTimers::new(gpu);
 
@@ -315,11 +328,12 @@ impl PhotonPipeline {
             spectral_lut_buf,
             segments_buf,
             circles_buf,
+            emitters_buf,
             sized,
             timers,
             frame_idx: 0,
             accum_frames: 0,
-            pending_clear: true,
+            pending_clear_mode: 1,
             pending_pulse: true,
         }
     }
@@ -341,6 +355,7 @@ impl PhotonPipeline {
         spectral_lut_buf: &wgpu::Buffer,
         segments_buf: &wgpu::Buffer,
         circles_buf: &wgpu::Buffer,
+        emitters_buf: &wgpu::Buffer,
     ) -> SizedBuffers {
         let num_px = u64::from(width) * u64::from(height);
         let accum_xyz_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -381,6 +396,7 @@ impl PhotonPipeline {
                 bg_buf(3, spectral_lut_buf),
                 bg_buf(4, segments_buf),
                 bg_buf(5, circles_buf),
+                bg_buf(6, emitters_buf),
             ],
         });
         let resolve_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -396,6 +412,7 @@ impl PhotonPipeline {
                 },
                 bg_buf(4, segments_buf),
                 bg_buf(5, circles_buf),
+                bg_buf(6, emitters_buf),
             ],
         });
         let agx_bg = agx_pass.create_bind_group(gpu, &hdr_view);
@@ -432,6 +449,7 @@ impl PhotonPipeline {
             &self.spectral_lut_buf,
             &self.segments_buf,
             &self.circles_buf,
+            &self.emitters_buf,
         );
         self.reset_accumulation();
     }
@@ -440,7 +458,7 @@ impl PhotonPipeline {
     pub fn reset_accumulation(&mut self) {
         self.frame_idx = 0;
         self.accum_frames = 0;
-        self.pending_clear = true;
+        self.pending_clear_mode = 1;
         self.pending_pulse = true;
     }
 
@@ -448,7 +466,15 @@ impl PhotonPipeline {
     /// restarting Pulse wavefronts or resetting PRNG temporal decorrelation.
     pub fn clear_accumulation(&mut self) {
         self.accum_frames = 0;
-        self.pending_clear = true;
+        self.pending_clear_mode = 1;
+    }
+
+    /// Smoothly blend the next Steady frame with the previous HDR average via temporal EMA
+    /// so smoothly animating scenes (like orbiting planets) stay noise-free without ghosting.
+    pub fn blend_accumulation(&mut self) {
+        if self.pending_clear_mode == 0 {
+            self.pending_clear_mode = 2;
+        }
     }
 
     /// Active photons dispatched per frame (full end-to-end trajectories in Accumulate mode;
@@ -531,11 +557,12 @@ impl PhotonPipeline {
             && self.frame_idx > 0
             && self.frame_idx.is_multiple_of(settings.pulse_period_frames);
         let pulse_trigger = self.pending_pulse || auto_pulse;
-        let clear_hdr = self.pending_clear;
+        let clear_mode = self.pending_clear_mode;
         self.pending_pulse = false;
-        self.pending_clear = false;
+        self.pending_clear_mode = 0;
 
-        if clear_hdr {
+        let prev_accum_frames = self.accum_frames.max(1);
+        if clear_mode != 0 {
             self.accum_frames = 1;
         } else {
             self.accum_frames += 1;
@@ -558,6 +585,21 @@ impl PhotonPipeline {
             (PhotonMode::Accumulate, false, _) => 2.0,
         };
 
+        let packed_emitters = scene.pack_gpu_emitters();
+        let num_emitters = packed_emitters.len().min(MAX_EMITTERS);
+        if num_emitters > 0 {
+            gpu.queue.write_buffer(
+                &self.emitters_buf,
+                0,
+                bytemuck::cast_slice(&packed_emitters[..num_emitters]),
+            );
+        }
+        let total_power: f32 = packed_emitters
+            .iter()
+            .map(|e| e.spec[1])
+            .sum::<f32>()
+            .max(0.01);
+
         let active_photons = self.dispatched_photons(scene, settings);
         let sim_u = SimUniforms {
             view: [
@@ -566,12 +608,7 @@ impl PhotonPipeline {
                 scene.view_half_height,
                 aspect,
             ],
-            emitter: [
-                scene.emitter_pos[0],
-                scene.emitter_pos[1],
-                scene.emitter_angle,
-                scene.emitter_spread,
-            ],
+            emitter: [total_power, 0.0, 0.0, 0.0],
             physics: [dt_substep, spin, rp, FIXED_SCALE],
             extra: [
                 splat_stride,
@@ -583,7 +620,7 @@ impl PhotonPipeline {
             flags: [
                 phys as u32,
                 settings.mode as u32,
-                scene.emitter_kind,
+                num_emitters as u32,
                 u32::from(pulse_trigger),
             ],
             counts: [
@@ -600,15 +637,23 @@ impl PhotonPipeline {
         // (active_photons / height), so multiplying by (height / active_photons) keeps visual
         // exposure consistent across all resolutions, drag/settle budgets, and photon counts.
         let norm = (h as f32) / (active_photons as f32).max(1.0);
-        let gain_k = match (settings.mode, phys) {
-            (PhotonMode::Accumulate, PhysicsKind::Optics) => 0.16,
-            (PhotonMode::Accumulate, PhysicsKind::Kerr) => 0.14,
-            (PhotonMode::Accumulate, _) => 0.22,
-            (PhotonMode::Pulse, PhysicsKind::Kerr) => 0.42,
-            (PhotonMode::Pulse, _) => 0.70,
+        let gain_k = match (settings.mode, phys, scene.id.is_solar_system()) {
+            (PhotonMode::Accumulate, PhysicsKind::Optics, true) => 0.42,
+            (PhotonMode::Accumulate, PhysicsKind::Optics, false) => 0.16 * total_power.sqrt(),
+            (PhotonMode::Accumulate, PhysicsKind::Kerr, _) => 0.14,
+            (PhotonMode::Accumulate, _, _) => 0.22,
+            (PhotonMode::Pulse, PhysicsKind::Kerr, _) => 0.42,
+            (PhotonMode::Pulse, _, true) => 1.25,
+            (PhotonMode::Pulse, _, false) => 0.70,
         };
         let base_gain = gain_k * norm * settings.exposure;
-        let accum_norm = 1.0 / (self.accum_frames as f32).max(1.0);
+        // For EMA blend mode (`clear_mode == 2`), pass previous `1 / prev_accum_frames` so shader
+        // normalizes the previous accumulated sum before mixing with the fresh single frame.
+        let accum_norm = if clear_mode == 2 {
+            1.0 / (prev_accum_frames as f32)
+        } else {
+            1.0 / (self.accum_frames as f32).max(1.0)
+        };
 
         let resolve_u = ResolveUniforms {
             view: sim_u.view,
@@ -628,8 +673,8 @@ impl PhotonPipeline {
             counts: [
                 scene.segments.len().min(MAX_SEGMENTS) as u32,
                 scene.circles.len().min(MAX_CIRCLES) as u32,
-                u32::from(clear_hdr),
-                0,
+                clear_mode,
+                num_emitters as u32,
             ],
         };
         gpu.queue

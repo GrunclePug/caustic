@@ -34,9 +34,73 @@ pub fn reflect(dir: DVec2, normal: DVec2) -> DVec2 {
     dir - 2.0 * dir.dot(normal) * normal
 }
 
+/// Exact Rayleigh atmospheric scattering coefficient scaling as `(550 nm / lambda)^4`.
+///
+/// Short blue/violet wavelengths scatter ~4-6x more strongly than red wavelengths,
+/// producing blue planetary skies and red-orange sunset / lunar-eclipse limbs.
+#[inline]
+pub fn rayleigh_sigma(lambda_nm: f64, base_density: f64) -> f64 {
+    let ratio = 550.0 / lambda_nm.clamp(380.0, 780.0);
+    let r2 = ratio * ratio;
+    base_density.max(0.0) * r2 * r2
+}
+
+/// Unnormalized Planck spectral radiance `B_lambda(T)` in visible nanometers (`380..780 nm`).
+#[inline]
+pub fn planck_radiance_nm(lambda_nm: f64, temp_k: f64) -> f64 {
+    const C2_NM_K: f64 = 1.438_776_877e7;
+    let lam = lambda_nm.clamp(380.0, 780.0);
+    let t = temp_k.clamp(1200.0, 40_000.0);
+    let x = C2_NM_K / (lam * t);
+    let inv_lam = 550.0 / lam;
+    let p5 = inv_lam.powi(5);
+    p5 / (x.exp_m1().max(1e-12))
+}
+
+/// Normalized Planck spectral weight over `[380, 780] nm` (mean value `~1.0` across the visible band).
+pub fn planck_visible_weight(lambda_nm: f64, temp_k: f64) -> f64 {
+    // 16-point midpoint normalization over [380, 780] nm (matches GPU shader).
+    let mut sum = 0.0_f64;
+    for i in 0..16 {
+        let l = 380.0 + (f64::from(i) + 0.5) * (400.0 / 16.0);
+        sum += planck_radiance_nm(l, temp_k);
+    }
+    let avg = (sum / 16.0).max(1e-30);
+    planck_radiance_nm(lambda_nm, temp_k) / avg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rayleigh_and_planck_laws_match_physics() {
+        // Rayleigh 1 / lambda^4 scaling: 450 nm vs 650 nm must equal (650/450)^4.
+        let s_blue = rayleigh_sigma(450.0, 1.0);
+        let s_red = rayleigh_sigma(650.0, 1.0);
+        let expected_ratio = (650.0_f64 / 450.0).powi(4);
+        assert!(
+            ((s_blue / s_red) - expected_ratio).abs() < 1e-12,
+            "Rayleigh ratio mismatch: got {}, expected {}",
+            s_blue / s_red,
+            expected_ratio
+        );
+
+        // Wien peak of 5778 K sunlight is near 501.5 nm (green-cyan), well above 400 and 700 nm.
+        let w_500 = planck_visible_weight(501.5, 5778.0);
+        let w_400 = planck_visible_weight(400.0, 5778.0);
+        let w_700 = planck_visible_weight(700.0, 5778.0);
+        assert!(
+            w_500 > w_400 && w_500 > w_700,
+            "5778 K should peak near 501 nm"
+        );
+
+        // Cool 3000 K star is red-heavy; hot 12000 K star is blue-heavy.
+        assert!(planck_visible_weight(700.0, 3000.0) > 5.0 * planck_visible_weight(420.0, 3000.0));
+        assert!(
+            planck_visible_weight(420.0, 12000.0) > 3.0 * planck_visible_weight(700.0, 12000.0)
+        );
+    }
 
     #[test]
     fn snell_fresnel_brewster_and_tir() {

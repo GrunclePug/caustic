@@ -1,9 +1,9 @@
-//! Unified minimal dark-glass interactive studio for `caustic`.
+//! Unified minimal dark-glass interactive photon playground & relativity studio for `caustic`.
 //!
-//! Hosts both the 3D Outgoing Kerr-Schild black hole tracer (`BlackHolePipeline`) and all
-//! 8 forward spectral photon simulations (`PhotonPipeline`: dispersive optical bench,
-//! graded-index optics, and equatorial Ingoing Kerr-Schild relativity) behind a single
-//! low-overhead `egui` 0.37 / `egui-wgpu` overlay (`H` or `Tab` hides the UI cleanly).
+//! Hosts both the 3D Outgoing Kerr-Schild black hole tracer and all 10 forward spectral
+//! photon modes (dispersive optics, Solar System orrery, multi-emitter sandbox, continuous
+//! GRIN eikonal optics, and equatorial Ingoing Kerr-Schild relativity) behind a minimal
+//! `egui` 0.37 / `egui-wgpu` overlay (`H` or `Tab` hides all UI cleanly).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,9 +28,11 @@ use caustic_blackhole::kerr::{
 };
 use caustic_core::gpu::GpuContext;
 use caustic_core::post::{DebugView, readback_rgba8_texture, write_rgba8_png};
+use caustic_core::spectrum::cie_1931_xyz;
 use caustic_photons::gpu_sim::{PhotonPipeline, PhotonSettings};
 use caustic_photons::scene::{
-    EMITTER_BEAM, EMITTER_POINT, ElementKind, GlassMaterial, PhotonMode, PhotonScene, PhotonSceneId,
+    ElementKind, EmitterKind, EmitterSpectrum, GlassMaterial, PhotonMode, PhotonScene,
+    PhotonSceneId, SceneCategory,
 };
 
 /// Stop stepping new photon frames in `Accumulate` mode once converged to save GPU/power.
@@ -54,10 +56,12 @@ impl StudioMode {
     pub fn category_badge(self) -> &'static str {
         match self {
             Self::BlackHole3D => "3D RELATIVITY",
+            Self::Photons(PhotonSceneId::SolarSystem) => "SOLAR ORRERY",
+            Self::Photons(PhotonSceneId::Sandbox) => "PLAYGROUND",
             Self::Photons(id) => match id.category() {
-                caustic_photons::scene::SceneCategory::Optics => "OPTICAL BENCH",
-                caustic_photons::scene::SceneCategory::Grin => "GRIN OPTICS",
-                caustic_photons::scene::SceneCategory::Relativity => "2D RELATIVITY",
+                SceneCategory::Optics => "OPTICAL BENCH",
+                SceneCategory::Grin => "GRIN OPTICS",
+                SceneCategory::Relativity => "2D RELATIVITY",
             },
         }
     }
@@ -83,11 +87,17 @@ pub struct StudioConfig {
     pub force_fallback: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    Emitter(usize),
+    Element(usize),
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CanvasDrag {
     Orbit3D,
-    EmitterMove,
-    EmitterAim,
+    EmitterMove { idx: usize },
+    EmitterAim { idx: usize },
     ElementMove { idx: usize, offset: [f32; 2] },
     ElementRotate { idx: usize },
 }
@@ -118,10 +128,11 @@ struct StudioApp {
     bh_full_res: bool,
     bh_last_input: Instant,
 
-    // 2D Forward photon state
+    // 2D Forward photon playground state
     photon_scene: PhotonScene,
     photon_settings: PhotonSettings,
-    selected_element: Option<usize>,
+    selection: Selection,
+    orbit_paused: bool,
     photon_last_edit: Instant,
     photon_was_dragging: bool,
 
@@ -161,7 +172,8 @@ impl StudioApp {
             bh_last_input: now,
             photon_scene: cfg.photon_scene,
             photon_settings: cfg.photon_settings,
-            selected_element: None,
+            selection: Selection::Emitter(0),
+            orbit_paused: false,
             photon_last_edit: now - Duration::from_secs(1),
             photon_was_dragging: false,
             init_width: cfg.width,
@@ -183,10 +195,18 @@ impl StudioApp {
         }
     }
 
+    fn active_emitter_idx(&self) -> usize {
+        match self.selection {
+            Selection::Emitter(i) if i < self.photon_scene.emitters.len() => i,
+            _ => 0,
+        }
+    }
+
     fn switch_mode(&mut self, next: StudioMode) {
         self.mode = next;
         self.drag = None;
-        self.selected_element = None;
+        self.selection = Selection::Emitter(0);
+        self.orbit_paused = false;
         match next {
             StudioMode::BlackHole3D => {
                 self.bh_trace_dirty = true;
@@ -331,15 +351,24 @@ impl StudioApp {
             KeyCode::KeyH | KeyCode::Tab => {
                 self.show_ui = !self.show_ui;
             }
+            KeyCode::KeyP
+                if matches!(self.mode, StudioMode::Photons(PhotonSceneId::SolarSystem)) =>
+            {
+                self.orbit_paused = !self.orbit_paused;
+                if self.orbit_paused {
+                    self.mark_photon_edited(false, false);
+                }
+            }
             KeyCode::Digit0 | KeyCode::Backquote => self.switch_mode(StudioMode::BlackHole3D),
             KeyCode::Digit1 => self.switch_mode(StudioMode::Photons(PhotonSceneId::Prism)),
             KeyCode::Digit2 => self.switch_mode(StudioMode::Photons(PhotonSceneId::Cardioid)),
             KeyCode::Digit3 => self.switch_mode(StudioMode::Photons(PhotonSceneId::Lens)),
-            KeyCode::Digit4 => self.switch_mode(StudioMode::Photons(PhotonSceneId::GrinLuneburg)),
-            KeyCode::Digit5 => self.switch_mode(StudioMode::Photons(PhotonSceneId::GrinBlackHole)),
-            KeyCode::Digit6 => self.switch_mode(StudioMode::Photons(PhotonSceneId::GrinMirage)),
-            KeyCode::Digit7 => self.switch_mode(StudioMode::Photons(PhotonSceneId::KerrBeam)),
-            KeyCode::Digit8 => self.switch_mode(StudioMode::Photons(PhotonSceneId::KerrPulsar)),
+            KeyCode::Digit4 => self.switch_mode(StudioMode::Photons(PhotonSceneId::SolarSystem)),
+            KeyCode::Digit5 => self.switch_mode(StudioMode::Photons(PhotonSceneId::Sandbox)),
+            KeyCode::Digit6 => self.switch_mode(StudioMode::Photons(PhotonSceneId::GrinLuneburg)),
+            KeyCode::Digit7 => self.switch_mode(StudioMode::Photons(PhotonSceneId::GrinBlackHole)),
+            KeyCode::Digit8 => self.switch_mode(StudioMode::Photons(PhotonSceneId::GrinMirage)),
+            KeyCode::Digit9 => self.switch_mode(StudioMode::Photons(PhotonSceneId::KerrBeam)),
             KeyCode::KeyS => self.save_screenshot(),
             KeyCode::KeyR => match self.mode {
                 StudioMode::BlackHole3D => {
@@ -389,32 +418,41 @@ impl StudioApp {
                     }
                 }
             }
-            KeyCode::KeyQ if matches!(self.mode, StudioMode::Photons(_)) => {
-                if let Some(idx) = self.selected_element
-                    && idx < self.photon_scene.elements.len()
-                {
+            KeyCode::KeyQ if matches!(self.mode, StudioMode::Photons(_)) => match self.selection {
+                Selection::Element(idx) if idx < self.photon_scene.elements.len() => {
                     self.photon_scene.elements[idx].angle += 0.08;
                     self.mark_photon_edited(true, true);
-                } else {
-                    self.photon_scene.emitter_angle += 0.06;
+                }
+                Selection::Emitter(idx) if idx < self.photon_scene.emitters.len() => {
+                    self.photon_scene.emitters[idx].angle += 0.06;
                     self.mark_photon_edited(false, true);
                 }
-            }
-            KeyCode::KeyE if matches!(self.mode, StudioMode::Photons(_)) => {
-                if let Some(idx) = self.selected_element
-                    && idx < self.photon_scene.elements.len()
-                {
+                _ => {}
+            },
+            KeyCode::KeyE if matches!(self.mode, StudioMode::Photons(_)) => match self.selection {
+                Selection::Element(idx) if idx < self.photon_scene.elements.len() => {
                     self.photon_scene.elements[idx].angle -= 0.08;
                     self.mark_photon_edited(true, true);
-                } else {
-                    self.photon_scene.emitter_angle -= 0.06;
+                }
+                Selection::Emitter(idx) if idx < self.photon_scene.emitters.len() => {
+                    self.photon_scene.emitters[idx].angle -= 0.06;
                     self.mark_photon_edited(false, true);
                 }
-            }
+                _ => {}
+            },
             KeyCode::Delete | KeyCode::Backspace if matches!(self.mode, StudioMode::Photons(_)) => {
-                if let Some(idx) = self.selected_element.take() {
-                    self.photon_scene.remove_element(idx);
-                    self.mark_photon_edited(true, false);
+                match self.selection {
+                    Selection::Element(idx) if idx < self.photon_scene.elements.len() => {
+                        self.photon_scene.remove_element(idx);
+                        self.selection = Selection::Emitter(0);
+                        self.mark_photon_edited(true, false);
+                    }
+                    Selection::Emitter(idx) if self.photon_scene.emitters.len() > 1 => {
+                        self.photon_scene.remove_emitter(idx);
+                        self.selection = Selection::Emitter(0);
+                        self.mark_photon_edited(false, false);
+                    }
+                    _ => {}
                 }
             }
             KeyCode::BracketRight => match self.mode {
@@ -477,36 +515,83 @@ impl StudioApp {
             return actions;
         }
 
-        // 1. Subtle world-space gizmos on background layer (emitter dot + selected optical element).
-        if matches!(self.mode, StudioMode::Photons(_)) {
+        // 1. Subtle world-space handles & Solar System planet labels on background layer.
+        if let StudioMode::Photons(scene_id) = self.mode {
             let painter = ctx.layer_painter(LayerId::background());
-            let em_pos = Self::world_to_egui(
-                self.photon_scene.emitter_pos,
-                &self.photon_scene,
-                width_px,
-                height_px,
-                ppp,
-            );
-            let aim = Vec2::new(
-                self.photon_scene.emitter_angle.cos(),
-                -self.photon_scene.emitter_angle.sin(),
-            );
-            painter.circle_filled(
-                em_pos,
-                3.5,
-                Color32::from_rgba_unmultiplied(240, 245, 255, 210),
-            );
-            painter.circle_stroke(
-                em_pos,
-                6.5,
-                Stroke::new(1.2, Color32::from_rgba_unmultiplied(128, 190, 255, 165)),
-            );
-            painter.line_segment(
-                [em_pos + aim * 7.0, em_pos + aim * 16.0],
-                Stroke::new(1.4, Color32::from_rgba_unmultiplied(128, 190, 255, 190)),
-            );
+            for (i, em) in self.photon_scene.emitters.iter().enumerate() {
+                let selected = self.selection == Selection::Emitter(i);
+                let em_pos =
+                    Self::world_to_egui(em.pos, &self.photon_scene, width_px, height_px, ppp);
+                let dot_col = spectrum_preview_color(em.spectrum);
 
-            if let Some(idx) = self.selected_element
+                if em.kind == EmitterKind::Disk {
+                    if selected {
+                        painter.circle_stroke(
+                            em_pos,
+                            9.0,
+                            Stroke::new(1.4, Color32::from_rgba_unmultiplied(128, 190, 255, 190)),
+                        );
+                    }
+                } else {
+                    let aim = Vec2::new(em.angle.cos(), -em.angle.sin());
+                    painter.circle_filled(em_pos, if selected { 4.0 } else { 3.0 }, dot_col);
+                    painter.circle_stroke(
+                        em_pos,
+                        if selected { 7.5 } else { 5.5 },
+                        Stroke::new(
+                            if selected { 1.5 } else { 1.0 },
+                            if selected {
+                                Color32::from_rgba_unmultiplied(128, 190, 255, 220)
+                            } else {
+                                Color32::from_rgba_unmultiplied(210, 220, 235, 120)
+                            },
+                        ),
+                    );
+                    if matches!(em.kind, EmitterKind::Beam | EmitterKind::Spot) {
+                        painter.line_segment(
+                            [em_pos + aim * 7.5, em_pos + aim * 17.0],
+                            Stroke::new(
+                                1.4,
+                                if selected {
+                                    Color32::from_rgba_unmultiplied(128, 190, 255, 210)
+                                } else {
+                                    Color32::from_rgba_unmultiplied(210, 220, 235, 110)
+                                },
+                            ),
+                        );
+                    }
+                }
+            }
+
+            if scene_id.is_solar_system() {
+                for el in &self.photon_scene.elements {
+                    if let ElementKind::Planet { radius, .. } = el.kind {
+                        let p = Self::world_to_egui(
+                            [el.pos[0], el.pos[1] - radius - 0.35],
+                            &self.photon_scene,
+                            width_px,
+                            height_px,
+                            ppp,
+                        );
+                        painter.text(
+                            p + Vec2::new(1.0, 1.0),
+                            Align2::CENTER_TOP,
+                            el.name,
+                            FontId::proportional(10.0),
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 210),
+                        );
+                        painter.text(
+                            p,
+                            Align2::CENTER_TOP,
+                            el.name,
+                            FontId::proportional(10.0),
+                            Color32::from_rgba_unmultiplied(230, 238, 250, 215),
+                        );
+                    }
+                }
+            }
+
+            if let Selection::Element(idx) = self.selection
                 && let Some(el) = self.photon_scene.elements.get(idx)
             {
                 let h_pos = Self::world_to_egui(
@@ -527,10 +612,12 @@ impl StudioApp {
                     3.0,
                     Color32::from_rgba_unmultiplied(122, 186, 255, 220),
                 );
-                painter.line_segment(
-                    [h_pos + dir * 9.0, h_pos + dir * 20.0],
-                    Stroke::new(1.4, Color32::from_rgba_unmultiplied(122, 186, 255, 200)),
-                );
+                if !matches!(el.kind, ElementKind::Planet { ring_outer, .. } if ring_outer <= 0.0) {
+                    painter.line_segment(
+                        [h_pos + dir * 9.0, h_pos + dir * 20.0],
+                        Stroke::new(1.4, Color32::from_rgba_unmultiplied(122, 186, 255, 200)),
+                    );
+                }
             }
         }
 
@@ -541,20 +628,20 @@ impl StudioApp {
                 Color32::from_rgba_unmultiplied(255, 255, 255, 22),
             ))
             .corner_radius(CornerRadius::same(11))
-            .inner_margin(Margin::symmetric(12, 7));
+            .inner_margin(Margin::symmetric(10, 6));
 
-        // 2. Top floating pill bar: brand + named mode switcher + live telemetry + inspector toggle.
+        // 2. Top floating pill bar: brand + all named modes + live telemetry + inspector toggle.
         egui::Area::new(Id::unique("caustic_top_bar"))
             .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 12.0))
             .fade_in(false)
             .show(&ctx, |ui| {
                 glass_frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.spacing_mut().item_spacing.x = 3.0;
                         ui.label(
                             RichText::new("caustic")
                                 .strong()
-                                .size(13.0)
+                                .size(12.5)
                                 .color(Color32::from_rgb(236, 241, 249)),
                         );
                         pill_divider(ui);
@@ -565,7 +652,7 @@ impl StudioApp {
                         pill_divider(ui);
 
                         for (i, id) in PhotonSceneId::ALL.iter().copied().enumerate() {
-                            if i == 3 || i == 6 {
+                            if i == 5 || i == 8 {
                                 pill_divider(ui);
                             }
                             let active = self.mode == StudioMode::Photons(id);
@@ -581,12 +668,12 @@ impl StudioApp {
                                 self.smoothed_fps, self.smoothed_ms
                             ))
                             .monospace()
-                            .size(11.0)
+                            .size(10.5)
                             .color(Color32::from_rgb(138, 150, 170)),
                         );
                         pill_divider(ui);
                         let toggle_lbl = if self.show_inspector {
-                            "Hide Panel"
+                            "Hide"
                         } else {
                             "Controls"
                         };
@@ -597,7 +684,7 @@ impl StudioApp {
                 });
             });
 
-        // 3. Collapsible right floating inspector (only relevant parameters for active mode).
+        // 3. Collapsible right floating inspector.
         if self.show_inspector {
             let panel_frame = Frame::new()
                 .fill(Color32::from_rgba_unmultiplied(11, 13, 18, 218))
@@ -608,426 +695,813 @@ impl StudioApp {
                 .corner_radius(CornerRadius::same(12))
                 .inner_margin(Margin::symmetric(14, 12));
 
+            let max_panel_h = ((height_px as f32) / ppp - 96.0).max(260.0);
+
             egui::Area::new(Id::unique("caustic_inspector"))
-                .anchor(Align2::RIGHT_TOP, Vec2::new(-14.0, 58.0))
+                .anchor(Align2::RIGHT_TOP, Vec2::new(-14.0, 56.0))
                 .fade_in(false)
                 .show(&ctx, |ui| {
                     panel_frame.show(ui, |ui| {
-                        ui.set_width(258.0);
-                        ui.spacing_mut().item_spacing.y = 8.0;
+                        ui.set_width(268.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(max_panel_h)
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 7.0;
 
-                        // Active mode header
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(self.mode.display_name())
-                                    .strong()
-                                    .size(14.5)
-                                    .color(Color32::from_rgb(240, 245, 252)),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
+                                // Active mode header
+                                ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(self.mode.category_badge())
-                                            .size(9.5)
-                                            .color(Color32::from_rgb(120, 176, 255)),
+                                        RichText::new(self.mode.display_name())
+                                            .strong()
+                                            .size(14.0)
+                                            .color(Color32::from_rgb(240, 245, 252)),
                                     );
-                                },
-                            );
-                        });
-                        subtle_rule(ui);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new(self.mode.category_badge())
+                                                    .size(9.5)
+                                                    .color(Color32::from_rgb(120, 176, 255)),
+                                            );
+                                        },
+                                    );
+                                });
+                                subtle_rule(ui);
 
-                        match self.mode {
-                            StudioMode::BlackHole3D => {
-                                let mut spin = self.bh_params.spin as f32;
-                                if labeled_slider(ui, "Spin a", &mut spin, -0.998..=0.998, false) {
-                                    self.bh_params.spin = f64::from(spin);
-                                    actions.bh_trace_dirty = true;
-                                }
-                                let mut disk = self.bh_settings.disk_enabled;
-                                if ui.checkbox(&mut disk, "Accretion Disk").changed() {
-                                    self.bh_settings.disk_enabled = disk;
-                                    actions.bh_trace_dirty = true;
-                                }
-                                if self.bh_settings.disk_enabled
-                                    && labeled_slider(
-                                        ui,
-                                        "Peak Temp (K)",
-                                        &mut self.bh_settings.disk_peak_temp_k,
-                                        2500.0..=12000.0,
-                                        false,
-                                    )
-                                {
-                                    actions.bh_shade_dirty = true;
-                                }
-                                if labeled_slider(
-                                    ui,
-                                    "Exposure",
-                                    &mut self.bh_settings.exposure,
-                                    0.15..=6.0,
-                                    true,
-                                ) {
-                                    actions.bh_shade_dirty = true;
-                                }
-
-                                section_label(ui, "VIEW");
-                                ui.horizontal_wrapped(|ui| {
-                                    for (lbl, dv) in [
-                                        ("Beauty", DebugView::Beauty),
-                                        ("Steps", DebugView::StepHeatmap),
-                                        ("Redshift", DebugView::Redshift),
-                                        ("Hits", DebugView::HitClass),
-                                    ] {
-                                        if mode_chip(ui, lbl, self.bh_settings.debug_view == dv) {
-                                            self.bh_settings.debug_view = dv;
+                                match self.mode {
+                                    StudioMode::BlackHole3D => {
+                                        let mut spin = self.bh_params.spin as f32;
+                                        if labeled_slider(
+                                            ui,
+                                            "Spin a",
+                                            &mut spin,
+                                            -0.998..=0.998,
+                                            false,
+                                        ) {
+                                            self.bh_params.spin = f64::from(spin);
+                                            actions.bh_trace_dirty = true;
+                                        }
+                                        let mut disk = self.bh_settings.disk_enabled;
+                                        if ui.checkbox(&mut disk, "Accretion Disk").changed() {
+                                            self.bh_settings.disk_enabled = disk;
+                                            actions.bh_trace_dirty = true;
+                                        }
+                                        if self.bh_settings.disk_enabled
+                                            && labeled_slider(
+                                                ui,
+                                                "Peak Temp (K)",
+                                                &mut self.bh_settings.disk_peak_temp_k,
+                                                2500.0..=12000.0,
+                                                false,
+                                            )
+                                        {
                                             actions.bh_shade_dirty = true;
                                         }
-                                    }
-                                });
-                            }
-                            StudioMode::Photons(id) => {
-                                // Transport mode toggle: Steady vs Wavefront Pulse
-                                section_label(ui, "TRANSPORT");
-                                ui.horizontal(|ui| {
-                                    if mode_chip(
-                                        ui,
-                                        "Steady",
-                                        self.photon_settings.mode == PhotonMode::Accumulate,
-                                    ) && self.photon_settings.mode != PhotonMode::Accumulate
-                                    {
-                                        self.photon_settings.mode = PhotonMode::Accumulate;
-                                        actions.photon_reset_accum = true;
-                                    }
-                                    if mode_chip(
-                                        ui,
-                                        "Wavefront",
-                                        self.photon_settings.mode == PhotonMode::Pulse,
-                                    ) && self.photon_settings.mode != PhotonMode::Pulse
-                                    {
-                                        self.photon_settings.mode = PhotonMode::Pulse;
-                                        actions.photon_reset_accum = true;
-                                    }
-                                    if self.photon_settings.mode == PhotonMode::Pulse {
-                                        if ui.button("Pulse").clicked() {
-                                            actions.fire_pulse = true;
-                                        }
-                                    } else {
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                let pct = ((accum_frames.min(MAX_CONVERGED_FRAMES)
-                                                    * 100)
-                                                    / MAX_CONVERGED_FRAMES)
-                                                    as u32;
-                                                ui.label(
-                                                    RichText::new(format!("{pct}%"))
-                                                        .monospace()
-                                                        .size(10.5)
-                                                        .color(Color32::from_rgb(122, 134, 152)),
-                                                );
-                                            },
-                                        );
-                                    }
-                                });
-
-                                if self.photon_settings.mode == PhotonMode::Pulse {
-                                    labeled_slider(
-                                        ui,
-                                        "Trail Persistence",
-                                        &mut self.photon_settings.pulse_decay,
-                                        0.65..=0.96,
-                                        false,
-                                    );
-                                }
-
-                                // Emitter type & spread
-                                section_label(ui, "EMITTER");
-                                ui.horizontal(|ui| {
-                                    if mode_chip(
-                                        ui,
-                                        "Beam",
-                                        self.photon_scene.emitter_kind == EMITTER_BEAM,
-                                    ) && self.photon_scene.emitter_kind != EMITTER_BEAM
-                                    {
-                                        self.photon_scene.emitter_kind = EMITTER_BEAM;
-                                        self.photon_scene.emitter_spread =
-                                            if id.is_kerr() { 8.0 } else { 1.2 };
-                                        actions.photon_edited = true;
-                                    }
-                                    if mode_chip(
-                                        ui,
-                                        "Point Source",
-                                        self.photon_scene.emitter_kind == EMITTER_POINT,
-                                    ) && self.photon_scene.emitter_kind != EMITTER_POINT
-                                    {
-                                        self.photon_scene.emitter_kind = EMITTER_POINT;
-                                        self.photon_scene.emitter_spread =
-                                            std::f32::consts::FRAC_PI_4;
-                                        actions.photon_edited = true;
-                                    }
-                                });
-
-                                if self.photon_scene.emitter_kind == EMITTER_BEAM {
-                                    let max_w = if id.is_kerr() { 16.0 } else { 4.8 };
-                                    if labeled_slider(
-                                        ui,
-                                        "Beam Width",
-                                        &mut self.photon_scene.emitter_spread,
-                                        0.04..=max_w,
-                                        false,
-                                    ) {
-                                        actions.photon_edited = true;
-                                    }
-                                } else {
-                                    let mut deg = self.photon_scene.emitter_spread.to_degrees();
-                                    if labeled_slider(
-                                        ui,
-                                        "Cone Half-Angle",
-                                        &mut deg,
-                                        2.0..=180.0,
-                                        false,
-                                    ) {
-                                        self.photon_scene.emitter_spread = deg.to_radians();
-                                        actions.photon_edited = true;
-                                    }
-                                }
-
-                                // Physics controls
-                                section_label(ui, "PHYSICS");
-                                if id.is_kerr() {
-                                    if labeled_slider(
-                                        ui,
-                                        "Kerr Spin a",
-                                        &mut self.photon_scene.spin,
-                                        -0.998..=0.998,
-                                        false,
-                                    ) {
-                                        actions.photon_edited = true;
-                                    }
-                                } else {
-                                    if labeled_slider(
-                                        ui,
-                                        "Dispersion",
-                                        &mut self.photon_scene.dispersion_scale,
-                                        0.0..=3.0,
-                                        false,
-                                    ) {
-                                        actions.photon_edited = true;
-                                        actions.photon_reupload = id.is_optics();
-                                    }
-                                    if id.is_grin()
-                                        && labeled_slider(
+                                        if labeled_slider(
                                             ui,
-                                            "Field Strength",
-                                            &mut self.photon_scene.grin_strength,
-                                            0.25..=2.2,
-                                            false,
-                                        )
-                                    {
-                                        actions.photon_edited = true;
+                                            "Exposure",
+                                            &mut self.bh_settings.exposure,
+                                            0.15..=6.0,
+                                            true,
+                                        ) {
+                                            actions.bh_shade_dirty = true;
+                                        }
+
+                                        section_label(ui, "VIEW");
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (lbl, dv) in [
+                                                ("Beauty", DebugView::Beauty),
+                                                ("Steps", DebugView::StepHeatmap),
+                                                ("Redshift", DebugView::Redshift),
+                                                ("Hits", DebugView::HitClass),
+                                            ] {
+                                                if mode_chip(
+                                                    ui,
+                                                    lbl,
+                                                    self.bh_settings.debug_view == dv,
+                                                ) {
+                                                    self.bh_settings.debug_view = dv;
+                                                    actions.bh_shade_dirty = true;
+                                                }
+                                            }
+                                        });
                                     }
-                                }
+                                    StudioMode::Photons(id) => {
+                                        // Solar System orbital controls
+                                        if id.is_solar_system() {
+                                            ui.label(
+                                                RichText::new("Orrery scale · 5778K sunlight & Rayleigh skies")
+                                                    .size(10.0)
+                                                    .color(Color32::from_rgb(138, 152, 174)),
+                                            );
+                                            ui.horizontal(|ui| {
+                                                let lbl = if self.orbit_paused {
+                                                    "Resume Orbits [P]"
+                                                } else {
+                                                    "Pause Orbits [P]"
+                                                };
+                                                if mode_chip(ui, lbl, !self.orbit_paused) {
+                                                    self.orbit_paused = !self.orbit_paused;
+                                                    if self.orbit_paused {
+                                                        actions.photon_edited = true;
+                                                    }
+                                                }
+                                            });
+                                            labeled_slider(
+                                                ui,
+                                                "Orbit Speed",
+                                                &mut self.photon_scene.orbit_speed,
+                                                0.0..=2.5,
+                                                false,
+                                            );
+                                            subtle_rule(ui);
+                                        }
 
-                                if labeled_slider(
-                                    ui,
-                                    "Exposure",
-                                    &mut self.photon_settings.exposure,
-                                    0.15..=4.0,
-                                    true,
-                                ) {
-                                    actions.photon_edited = true;
-                                }
+                                        // Transport mode: Steady vs Wavefront
+                                        section_label(ui, "TRANSPORT");
+                                        ui.horizontal(|ui| {
+                                            if mode_chip(
+                                                ui,
+                                                "Steady",
+                                                self.photon_settings.mode == PhotonMode::Accumulate,
+                                            ) && self.photon_settings.mode != PhotonMode::Accumulate
+                                            {
+                                                self.photon_settings.mode = PhotonMode::Accumulate;
+                                                actions.photon_reset_accum = true;
+                                            }
+                                            if mode_chip(
+                                                ui,
+                                                "Wavefront",
+                                                self.photon_settings.mode == PhotonMode::Pulse,
+                                            ) && self.photon_settings.mode != PhotonMode::Pulse
+                                            {
+                                                self.photon_settings.mode = PhotonMode::Pulse;
+                                                actions.photon_reset_accum = true;
+                                            }
+                                            if self.photon_settings.mode == PhotonMode::Pulse {
+                                                if ui.button("Pulse").clicked() {
+                                                    actions.fire_pulse = true;
+                                                }
+                                            } else {
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        let pct = ((accum_frames
+                                                            .min(MAX_CONVERGED_FRAMES)
+                                                            * 100)
+                                                            / MAX_CONVERGED_FRAMES)
+                                                            as u32;
+                                                        ui.label(
+                                                            RichText::new(format!("{pct}%"))
+                                                                .monospace()
+                                                                .size(10.5)
+                                                                .color(Color32::from_rgb(
+                                                                    122, 134, 152,
+                                                                )),
+                                                        );
+                                                    },
+                                                );
+                                            }
+                                        });
 
-                                // Interactive Optical Bench controls (only for Optics modes!)
-                                if id.is_optics() {
-                                    subtle_rule(ui);
-                                    section_label(ui, "OPTICAL BENCH");
-                                    ui.horizontal_wrapped(|ui| {
-                                        let spawn_pos = self.photon_scene.view_center;
-                                        if ui.button("+ Prism").clicked() {
-                                            let idx = self.photon_scene.add_element(
-                                                ElementKind::Prism { radius: 1.8 },
-                                                spawn_pos,
-                                                0.0,
-                                                GlassMaterial::StudioFlint,
+                                        if self.photon_settings.mode == PhotonMode::Pulse {
+                                            labeled_slider(
+                                                ui,
+                                                "Trail",
+                                                &mut self.photon_settings.pulse_decay,
+                                                0.65..=0.96,
+                                                false,
                                             );
-                                            self.selected_element = Some(idx);
-                                            actions.photon_reupload = true;
-                                            actions.photon_edited = true;
                                         }
-                                        if ui.button("+ Lens").clicked() {
-                                            let idx = self.photon_scene.add_element(
-                                                ElementKind::Lens {
-                                                    radius: 3.4,
-                                                    half_offset: 2.4,
-                                                },
-                                                spawn_pos,
-                                                0.0,
-                                                GlassMaterial::CrownBk7,
-                                            );
-                                            self.selected_element = Some(idx);
-                                            actions.photon_reupload = true;
-                                            actions.photon_edited = true;
-                                        }
-                                        if ui.button("+ Mirror").clicked() {
-                                            let idx = self.photon_scene.add_element(
-                                                ElementKind::FlatMirror { half_len: 1.8 },
-                                                spawn_pos,
-                                                0.35,
-                                                GlassMaterial::StudioFlint,
-                                            );
-                                            self.selected_element = Some(idx);
-                                            actions.photon_reupload = true;
-                                            actions.photon_edited = true;
-                                        }
-                                        if ui.button("+ Arc").clicked() {
-                                            let idx = self.photon_scene.add_element(
-                                                ElementKind::CurvedMirror {
-                                                    radius: 3.2,
-                                                    arc_half_angle: 0.75,
-                                                },
-                                                [spawn_pos[0] - 2.0, spawn_pos[1]],
-                                                0.0,
-                                                GlassMaterial::StudioFlint,
-                                            );
-                                            self.selected_element = Some(idx);
-                                            actions.photon_reupload = true;
-                                            actions.photon_edited = true;
-                                        }
-                                        if ui.button("+ Stop").clicked() {
-                                            let idx = self.photon_scene.add_element(
-                                                ElementKind::Absorber { half_len: 1.4 },
-                                                spawn_pos,
-                                                0.0,
-                                                GlassMaterial::StudioFlint,
-                                            );
-                                            self.selected_element = Some(idx);
-                                            actions.photon_reupload = true;
-                                            actions.photon_edited = true;
-                                        }
-                                    });
 
-                                    if let Some(idx) = self.selected_element
-                                        && idx < self.photon_scene.elements.len()
-                                    {
-                                        let mut delete_it = false;
-                                        let el_label = self.photon_scene.elements[idx].kind.label();
-                                        let is_glass =
-                                            self.photon_scene.elements[idx].kind.is_glass();
+                                        // Multi-emitter controls
+                                        subtle_rule(ui);
+                                        section_label(ui, "EMITTERS");
+                                        ui.horizontal_wrapped(|ui| {
+                                            let spawn_pos = [
+                                                self.photon_scene.view_center[0]
+                                                    - self.photon_scene.view_half_height * 0.8,
+                                                self.photon_scene.view_center[1],
+                                            ];
+                                            if ui.small_button("+ Beam").clicked() {
+                                                let idx = self.photon_scene.add_emitter(
+                                                    EmitterKind::Beam,
+                                                    EmitterSpectrum::WhiteFlat,
+                                                    spawn_pos,
+                                                    0.0,
+                                                    0.28,
+                                                    1.0,
+                                                );
+                                                self.selection = Selection::Emitter(idx);
+                                                actions.photon_edited = true;
+                                            }
+                                            if ui.small_button("+ Laser").clicked() {
+                                                let idx = self.photon_scene.add_emitter(
+                                                    EmitterKind::Beam,
+                                                    EmitterSpectrum::Laser(532.0),
+                                                    [spawn_pos[0], spawn_pos[1] - 1.2],
+                                                    0.15,
+                                                    0.08,
+                                                    0.6,
+                                                );
+                                                self.selection = Selection::Emitter(idx);
+                                                actions.photon_edited = true;
+                                            }
+                                            if ui.small_button("+ Star").clicked() {
+                                                let idx = self.photon_scene.add_emitter(
+                                                    EmitterKind::Disk,
+                                                    EmitterSpectrum::Blackbody(5778.0),
+                                                    self.photon_scene.view_center,
+                                                    0.0,
+                                                    0.65,
+                                                    1.0,
+                                                );
+                                                self.selection = Selection::Emitter(idx);
+                                                actions.photon_edited = true;
+                                            }
+                                            if ui.small_button("+ Spot").clicked() {
+                                                let idx = self.photon_scene.add_emitter(
+                                                    EmitterKind::Spot,
+                                                    EmitterSpectrum::Blackbody(5778.0),
+                                                    spawn_pos,
+                                                    0.0,
+                                                    0.35,
+                                                    1.0,
+                                                );
+                                                self.selection = Selection::Emitter(idx);
+                                                actions.photon_edited = true;
+                                            }
+                                        });
 
-                                        Frame::new()
-                                            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 7))
-                                            .stroke(Stroke::new(
-                                                1.0,
-                                                Color32::from_rgba_unmultiplied(122, 186, 255, 65),
-                                            ))
-                                            .corner_radius(CornerRadius::same(8))
-                                            .inner_margin(Margin::same(8))
-                                            .show(ui, |ui| {
+                                        // Selected emitter editor card
+                                        if let Selection::Emitter(eidx) = self.selection
+                                            && eidx < self.photon_scene.emitters.len()
+                                        {
+                                            let mut del_em = false;
+                                            let can_del = self.photon_scene.emitters.len() > 1;
+                                            let em = &mut self.photon_scene.emitters[eidx];
+                                            let swatch = spectrum_preview_color(em.spectrum);
+
+                                            card_frame().show(ui, |ui| {
                                                 ui.horizontal(|ui| {
+                                                    let (r, _) = ui.allocate_exact_size(
+                                                        Vec2::splat(9.0),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().circle_filled(
+                                                        r.center(),
+                                                        4.5,
+                                                        swatch,
+                                                    );
                                                     ui.label(
-                                                        RichText::new(el_label)
-                                                            .strong()
-                                                            .size(11.5)
-                                                            .color(Color32::from_rgb(
-                                                                220, 232, 248,
-                                                            )),
+                                                        RichText::new(format!(
+                                                            "Emitter #{} ({})",
+                                                            eidx + 1,
+                                                            em.kind.label()
+                                                        ))
+                                                        .strong()
+                                                        .size(11.5)
+                                                        .color(Color32::from_rgb(224, 234, 248)),
                                                     );
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
-                                                            if ui.small_button("Delete").clicked() {
-                                                                delete_it = true;
-                                                            }
-                                                        },
-                                                    );
+                                                    if can_del {
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                if ui.small_button("Delete").clicked()
+                                                                {
+                                                                    del_em = true;
+                                                                }
+                                                            },
+                                                        );
+                                                    }
                                                 });
 
-                                                if is_glass {
+                                                // Shape chips
+                                                ui.horizontal_wrapped(|ui| {
+                                                    for k in [
+                                                        EmitterKind::Beam,
+                                                        EmitterKind::Point,
+                                                        EmitterKind::Spot,
+                                                        EmitterKind::Disk,
+                                                    ] {
+                                                        if mode_chip(ui, k.label(), em.kind == k)
+                                                            && em.kind != k
+                                                        {
+                                                            em.kind = k;
+                                                            em.spread = match k {
+                                                                EmitterKind::Beam => {
+                                                                    if id.is_kerr() { 8.0 } else { 0.45 }
+                                                                }
+                                                                EmitterKind::Point => {
+                                                                    std::f32::consts::PI
+                                                                }
+                                                                EmitterKind::Spot => 0.35,
+                                                                EmitterKind::Disk => 0.85,
+                                                            };
+                                                            actions.photon_edited = true;
+                                                        }
+                                                    }
+                                                });
+
+                                                // Spectrum chips (hidden on Kerr where frequency shift owns color)
+                                                if !id.is_kerr() {
                                                     ui.horizontal_wrapped(|ui| {
-                                                        for mat in GlassMaterial::ALL {
-                                                            let sel = self.photon_scene.elements
-                                                                [idx]
-                                                                .material
-                                                                == mat;
-                                                            if mode_chip(ui, mat.label(), sel) {
-                                                                self.photon_scene.elements[idx]
-                                                                    .material = mat;
-                                                                actions.photon_reupload = true;
+                                                        let is_white = matches!(
+                                                            em.spectrum,
+                                                            EmitterSpectrum::WhiteFlat
+                                                        );
+                                                        let is_bb = matches!(
+                                                            em.spectrum,
+                                                            EmitterSpectrum::Blackbody(_)
+                                                        );
+                                                        let is_laser = matches!(
+                                                            em.spectrum,
+                                                            EmitterSpectrum::Laser(_)
+                                                        );
+                                                        if mode_chip(ui, "White", is_white)
+                                                            && !is_white
+                                                        {
+                                                            em.spectrum = EmitterSpectrum::WhiteFlat;
+                                                            actions.photon_edited = true;
+                                                        }
+                                                        if mode_chip(ui, "Star / Sun", is_bb)
+                                                            && !is_bb
+                                                        {
+                                                            em.spectrum =
+                                                                EmitterSpectrum::Blackbody(5778.0);
+                                                            actions.photon_edited = true;
+                                                        }
+                                                        if mode_chip(ui, "Laser", is_laser)
+                                                            && !is_laser
+                                                        {
+                                                            em.spectrum =
+                                                                EmitterSpectrum::Laser(532.0);
+                                                            actions.photon_edited = true;
+                                                        }
+                                                    });
+
+                                                    match &mut em.spectrum {
+                                                        EmitterSpectrum::Blackbody(temp) => {
+                                                            if labeled_slider(
+                                                                ui,
+                                                                "Temp (K)",
+                                                                temp,
+                                                                2000.0..=15000.0,
+                                                                true,
+                                                            ) {
                                                                 actions.photon_edited = true;
                                                             }
                                                         }
-                                                    });
+                                                        EmitterSpectrum::Laser(nm) => {
+                                                            if labeled_slider(
+                                                                ui,
+                                                                "Color (nm)",
+                                                                nm,
+                                                                400.0..=700.0,
+                                                                false,
+                                                            ) {
+                                                                actions.photon_edited = true;
+                                                            }
+                                                        }
+                                                        EmitterSpectrum::WhiteFlat => {}
+                                                    }
                                                 }
 
-                                                let mut deg = self.photon_scene.elements[idx]
-                                                    .angle
-                                                    .to_degrees()
-                                                    .rem_euclid(360.0);
-                                                if deg > 180.0 {
-                                                    deg -= 360.0;
+                                                match em.kind {
+                                                    EmitterKind::Beam => {
+                                                        let max_w =
+                                                            if id.is_kerr() { 16.0 } else { 4.8 };
+                                                        if labeled_slider(
+                                                            ui,
+                                                            "Width",
+                                                            &mut em.spread,
+                                                            0.03..=max_w,
+                                                            false,
+                                                        ) {
+                                                            actions.photon_edited = true;
+                                                        }
+                                                    }
+                                                    EmitterKind::Spot => {
+                                                        let mut deg = em.spread.to_degrees();
+                                                        if labeled_slider(
+                                                            ui,
+                                                            "Cone",
+                                                            &mut deg,
+                                                            2.0..=170.0,
+                                                            false,
+                                                        ) {
+                                                            em.spread = deg.to_radians();
+                                                            actions.photon_edited = true;
+                                                        }
+                                                    }
+                                                    EmitterKind::Disk => {
+                                                        if labeled_slider(
+                                                            ui,
+                                                            "Radius",
+                                                            &mut em.spread,
+                                                            0.15..=2.5,
+                                                            false,
+                                                        ) {
+                                                            actions.photon_edited = true;
+                                                        }
+                                                    }
+                                                    EmitterKind::Point => {}
                                                 }
-                                                if labeled_slider(
+
+                                                if can_del
+                                                    && labeled_slider(
+                                                        ui,
+                                                        "Power",
+                                                        &mut em.power,
+                                                        0.1..=3.0,
+                                                        false,
+                                                    )
+                                                {
+                                                    actions.photon_edited = true;
+                                                }
+                                            });
+
+                                            if del_em {
+                                                self.photon_scene.remove_emitter(eidx);
+                                                self.selection = Selection::Emitter(0);
+                                                actions.photon_edited = true;
+                                            }
+                                        }
+
+                                        // Physics controls
+                                        subtle_rule(ui);
+                                        section_label(ui, "PHYSICS");
+                                        if id.is_kerr() {
+                                            if labeled_slider(
+                                                ui,
+                                                "Kerr Spin a",
+                                                &mut self.photon_scene.spin,
+                                                -0.998..=0.998,
+                                                false,
+                                            ) {
+                                                actions.photon_edited = true;
+                                            }
+                                        } else {
+                                            if !id.is_solar_system()
+                                                && labeled_slider(
                                                     ui,
-                                                    "Angle",
-                                                    &mut deg,
-                                                    -180.0..=180.0,
+                                                    "Dispersion",
+                                                    &mut self.photon_scene.dispersion_scale,
+                                                    0.0..=3.0,
                                                     false,
-                                                ) {
-                                                    self.photon_scene.elements[idx].angle =
-                                                        deg.to_radians();
+                                                )
+                                            {
+                                                actions.photon_edited = true;
+                                                actions.photon_reupload = id.is_optics();
+                                            }
+                                            if id.is_grin()
+                                                && labeled_slider(
+                                                    ui,
+                                                    "Strength",
+                                                    &mut self.photon_scene.grin_strength,
+                                                    0.25..=2.2,
+                                                    false,
+                                                )
+                                            {
+                                                actions.photon_edited = true;
+                                            }
+                                        }
+
+                                        if labeled_slider(
+                                            ui,
+                                            "Exposure",
+                                            &mut self.photon_settings.exposure,
+                                            0.15..=4.0,
+                                            true,
+                                        ) {
+                                            actions.photon_edited = true;
+                                        }
+
+                                        // Interactive Playground / Optical Bench
+                                        if id.is_optics() {
+                                            subtle_rule(ui);
+                                            section_label(ui, "OBJECTS");
+                                            ui.horizontal_wrapped(|ui| {
+                                                let c = self.photon_scene.view_center;
+                                                if ui.small_button("+ Prism").clicked() {
+                                                    let idx = self.photon_scene.add_element(
+                                                        "Prism",
+                                                        ElementKind::Prism { radius: 1.8 },
+                                                        c,
+                                                        0.0,
+                                                        GlassMaterial::StudioFlint,
+                                                    );
+                                                    self.selection = Selection::Element(idx);
                                                     actions.photon_reupload = true;
                                                     actions.photon_edited = true;
                                                 }
-
-                                                let mut sz =
-                                                    self.photon_scene.elements[idx].kind.size();
-                                                if labeled_slider(
-                                                    ui,
-                                                    "Size",
-                                                    &mut sz,
-                                                    0.7..=6.5,
-                                                    false,
-                                                ) {
-                                                    self.photon_scene.elements[idx]
-                                                        .kind
-                                                        .set_size(sz);
+                                                if ui.small_button("+ Lens").clicked() {
+                                                    let idx = self.photon_scene.add_element(
+                                                        "Lens",
+                                                        ElementKind::Lens {
+                                                            radius: 3.4,
+                                                            half_offset: 2.4,
+                                                        },
+                                                        c,
+                                                        0.0,
+                                                        GlassMaterial::CrownBk7,
+                                                    );
+                                                    self.selection = Selection::Element(idx);
+                                                    actions.photon_reupload = true;
+                                                    actions.photon_edited = true;
+                                                }
+                                                if ui.small_button("+ Mirror").clicked() {
+                                                    let idx = self.photon_scene.add_element(
+                                                        "Mirror",
+                                                        ElementKind::FlatMirror { half_len: 1.8 },
+                                                        c,
+                                                        0.35,
+                                                        GlassMaterial::CrownBk7,
+                                                    );
+                                                    self.selection = Selection::Element(idx);
+                                                    actions.photon_reupload = true;
+                                                    actions.photon_edited = true;
+                                                }
+                                                if ui.small_button("+ Arc").clicked() {
+                                                    let idx = self.photon_scene.add_element(
+                                                        "Curved Mirror",
+                                                        ElementKind::CurvedMirror {
+                                                            radius: 3.2,
+                                                            arc_half_angle: 0.75,
+                                                        },
+                                                        [c[0] - 2.0, c[1]],
+                                                        0.0,
+                                                        GlassMaterial::CrownBk7,
+                                                    );
+                                                    self.selection = Selection::Element(idx);
+                                                    actions.photon_reupload = true;
+                                                    actions.photon_edited = true;
+                                                }
+                                                if ui.small_button("+ Splitter").clicked() {
+                                                    let idx = self.photon_scene.add_element(
+                                                        "Beam Splitter",
+                                                        ElementKind::BeamSplitter { half_len: 1.8 },
+                                                        c,
+                                                        0.785,
+                                                        GlassMaterial::CrownBk7,
+                                                    );
+                                                    self.selection = Selection::Element(idx);
+                                                    actions.photon_reupload = true;
+                                                    actions.photon_edited = true;
+                                                }
+                                                if ui.small_button("+ Wall").clicked() {
+                                                    let idx = self.photon_scene.add_element(
+                                                        "Matte Wall",
+                                                        ElementKind::MatteWall {
+                                                            half_len: 2.0,
+                                                            color: [0.85, 0.85, 0.88],
+                                                        },
+                                                        [c[0] + 2.5, c[1]],
+                                                        0.0,
+                                                        GlassMaterial::CrownBk7,
+                                                    );
+                                                    self.selection = Selection::Element(idx);
+                                                    actions.photon_reupload = true;
+                                                    actions.photon_edited = true;
+                                                }
+                                                if ui.small_button("+ Planet").clicked() {
+                                                    let idx = self.photon_scene.add_element(
+                                                        "Planet",
+                                                        ElementKind::Planet {
+                                                            radius: 0.75,
+                                                            albedo: [0.32, 0.55, 0.80],
+                                                            atmo_thickness: 0.45,
+                                                            atmo_density: 2.0,
+                                                            ring_outer: 0.0,
+                                                            orbit_radius: 0.0,
+                                                            orbit_speed: 0.0,
+                                                            orbit_phase: 0.0,
+                                                            parent_idx: None,
+                                                        },
+                                                        [c[0] + 1.5, c[1]],
+                                                        0.0,
+                                                        GlassMaterial::CrownBk7,
+                                                    );
+                                                    self.selection = Selection::Element(idx);
+                                                    actions.photon_reupload = true;
+                                                    actions.photon_edited = true;
+                                                }
+                                                if ui.small_button("+ Stop").clicked() {
+                                                    let idx = self.photon_scene.add_element(
+                                                        "Beam Stop",
+                                                        ElementKind::Absorber { half_len: 1.4 },
+                                                        c,
+                                                        0.0,
+                                                        GlassMaterial::CrownBk7,
+                                                    );
+                                                    self.selection = Selection::Element(idx);
+                                                    actions.photon_reupload = true;
+                                                    actions.photon_edited = true;
+                                                }
+                                                if !self.photon_scene.elements.is_empty()
+                                                    && ui.small_button("Clear").clicked()
+                                                {
+                                                    self.photon_scene.clear_elements();
+                                                    self.selection = Selection::Emitter(0);
                                                     actions.photon_reupload = true;
                                                     actions.photon_edited = true;
                                                 }
                                             });
 
-                                        if delete_it {
-                                            self.photon_scene.remove_element(idx);
-                                            self.selected_element = None;
-                                            actions.photon_reupload = true;
-                                            actions.photon_edited = true;
+                                            // Selected object inspector card
+                                            if let Selection::Element(idx) = self.selection
+                                                && idx < self.photon_scene.elements.len()
+                                            {
+                                                let mut delete_it = false;
+                                                let el_name = self.photon_scene.elements[idx].name;
+                                                let is_glass =
+                                                    self.photon_scene.elements[idx].kind.is_glass();
+
+                                                card_frame().show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            RichText::new(el_name)
+                                                                .strong()
+                                                                .size(11.5)
+                                                                .color(Color32::from_rgb(
+                                                                    224, 234, 248,
+                                                                )),
+                                                        );
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                if ui.small_button("Delete").clicked()
+                                                                {
+                                                                    delete_it = true;
+                                                                }
+                                                            },
+                                                        );
+                                                    });
+
+                                                    if is_glass {
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            for mat in GlassMaterial::ALL {
+                                                                let sel =
+                                                                    self.photon_scene.elements[idx]
+                                                                        .material
+                                                                        == mat;
+                                                                if mode_chip(ui, mat.label(), sel) {
+                                                                    self.photon_scene.elements[idx]
+                                                                        .material = mat;
+                                                                    actions.photon_reupload = true;
+                                                                    actions.photon_edited = true;
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+
+                                                    match &mut self.photon_scene.elements[idx].kind {
+                                                        ElementKind::Planet {
+                                                            albedo,
+                                                            atmo_thickness,
+                                                            atmo_density,
+                                                            ring_outer,
+                                                            radius,
+                                                            ..
+                                                        } => {
+                                                            ui.horizontal_wrapped(|ui| {
+                                                                for (lbl, col, atmo_t, atmo_d) in [
+                                                                    ("Earth", [0.30, 0.52, 0.78], 0.48, 2.1),
+                                                                    ("Mars", [0.84, 0.36, 0.22], 0.24, 0.65),
+                                                                    ("Venus", [0.88, 0.78, 0.54], 0.42, 2.2),
+                                                                    ("Moon", [0.68, 0.67, 0.64], 0.0, 0.0),
+                                                                ] {
+                                                                    if ui.small_button(lbl).clicked() {
+                                                                        *albedo = col;
+                                                                        *atmo_thickness = atmo_t;
+                                                                        *atmo_density = atmo_d;
+                                                                        actions.photon_reupload = true;
+                                                                        actions.photon_edited = true;
+                                                                    }
+                                                                }
+                                                            });
+                                                            if labeled_slider(
+                                                                ui,
+                                                                "Atmosphere",
+                                                                atmo_density,
+                                                                0.0..=3.5,
+                                                                false,
+                                                            ) {
+                                                                if *atmo_density > 0.02
+                                                                    && *atmo_thickness < 0.1
+                                                                {
+                                                                    *atmo_thickness = 0.45;
+                                                                }
+                                                                actions.photon_reupload = true;
+                                                                actions.photon_edited = true;
+                                                            }
+                                                            let mut has_ring =
+                                                                *ring_outer > *radius * 1.15;
+                                                            if ui.checkbox(&mut has_ring, "Icy Rings").changed() {
+                                                                *ring_outer = if has_ring {
+                                                                    *radius * 2.15
+                                                                } else {
+                                                                    0.0
+                                                                };
+                                                                actions.photon_reupload = true;
+                                                                actions.photon_edited = true;
+                                                            }
+                                                        }
+                                                        ElementKind::MatteWall { color, .. } => {
+                                                            ui.horizontal_wrapped(|ui| {
+                                                                for (lbl, col) in [
+                                                                    ("White", [0.88, 0.88, 0.90]),
+                                                                    ("Red", [0.88, 0.20, 0.16]),
+                                                                    ("Green", [0.20, 0.82, 0.28]),
+                                                                    ("Blue", [0.20, 0.44, 0.90]),
+                                                                    ("Gold", [0.92, 0.72, 0.22]),
+                                                                ] {
+                                                                    if ui.small_button(lbl).clicked() {
+                                                                        *color = col;
+                                                                        actions.photon_reupload = true;
+                                                                        actions.photon_edited = true;
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                        _ => {}
+                                                    }
+
+                                                    let mut deg = self.photon_scene.elements[idx]
+                                                        .angle
+                                                        .to_degrees()
+                                                        .rem_euclid(360.0);
+                                                    if deg > 180.0 {
+                                                        deg -= 360.0;
+                                                    }
+                                                    if labeled_slider(
+                                                        ui,
+                                                        "Angle",
+                                                        &mut deg,
+                                                        -180.0..=180.0,
+                                                        false,
+                                                    ) {
+                                                        self.photon_scene.elements[idx].angle =
+                                                            deg.to_radians();
+                                                        actions.photon_reupload = true;
+                                                        actions.photon_edited = true;
+                                                    }
+
+                                                    let mut sz =
+                                                        self.photon_scene.elements[idx].kind.size();
+                                                    if labeled_slider(
+                                                        ui,
+                                                        "Size",
+                                                        &mut sz,
+                                                        0.2..=6.5,
+                                                        false,
+                                                    ) {
+                                                        self.photon_scene.elements[idx]
+                                                            .kind
+                                                            .set_size(sz);
+                                                        actions.photon_reupload = true;
+                                                        actions.photon_edited = true;
+                                                    }
+                                                });
+
+                                                if delete_it {
+                                                    self.photon_scene.remove_element(idx);
+                                                    self.selection = Selection::Emitter(0);
+                                                    actions.photon_reupload = true;
+                                                    actions.photon_edited = true;
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        }
 
-                        subtle_rule(ui);
-                        ui.horizontal(|ui| {
-                            if ui.button("Reset").clicked() {
-                                actions.reset = true;
-                            }
-                            if ui.button("Save PNG").clicked() {
-                                actions.save_png = true;
-                            }
-                        });
+                                subtle_rule(ui);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Reset").clicked() {
+                                        actions.reset = true;
+                                    }
+                                    if ui.button("Save PNG").clicked() {
+                                        actions.save_png = true;
+                                    }
+                                });
+                            });
                     });
                 });
         }
 
-        // 4. Bottom-left subtle gesture hint & temporary screenshot toast.
+        // 4. Bottom-left subtle gesture hint pill & temporary screenshot toast.
         let hint_text = match self.mode {
             StudioMode::BlackHole3D => "LMB Orbit · Scroll Zoom · H Hide UI",
+            StudioMode::Photons(PhotonSceneId::SolarSystem) => {
+                "P Pause Orbits · M Wavefront · LMB Drag Planet/Sun · Scroll Zoom · H Hide UI"
+            }
             StudioMode::Photons(id) if id.is_optics() => {
-                "LMB Move Emitter / Element · Shift+LMB Rotate · RMB Aim · Scroll Zoom · H Hide UI"
+                "LMB Drag Emitter / Object · Shift+LMB Rotate · RMB Aim · Scroll Zoom · H Hide UI"
             }
             StudioMode::Photons(_) => {
                 "LMB Move Emitter · RMB Aim · Space Pulse · Scroll Zoom · H Hide UI"
@@ -1072,16 +1546,31 @@ impl StudioApp {
             return;
         }
 
-        // Smooth FPS / frame-time telemetry.
         let now = Instant::now();
-        let dt_ms = (now - self.last_frame_instant).as_secs_f32() * 1000.0;
+        let dt_sec = (now - self.last_frame_instant)
+            .as_secs_f32()
+            .clamp(0.0, 0.1);
+        let dt_ms = dt_sec * 1000.0;
         self.last_frame_instant = now;
         if dt_ms > 0.05 && dt_ms < 2000.0 {
             self.smoothed_ms = self.smoothed_ms * 0.90 + dt_ms * 0.10;
             self.smoothed_fps = 1000.0 / self.smoothed_ms.max(0.1);
         }
 
-        // Check 3D black hole settle timeout (half-res during drag -> full-res on settle).
+        // Advance Solar System orbital animation when running.
+        if matches!(self.mode, StudioMode::Photons(PhotonSceneId::SolarSystem))
+            && !self.orbit_paused
+            && self.drag.is_none()
+            && self.photon_scene.step_orbits(dt_sec)
+            && let Some(gfx) = &mut self.gfx
+        {
+            gfx.photon_pipeline
+                .upload_scene(&gfx.gpu, &self.photon_scene);
+            if self.photon_settings.mode == PhotonMode::Accumulate {
+                gfx.photon_pipeline.blend_accumulation();
+            }
+        }
+
         if self.mode == StudioMode::BlackHole3D
             && !self.bh_full_res
             && self.drag.is_none()
@@ -1091,7 +1580,6 @@ impl StudioApp {
             self.bh_trace_dirty = true;
         }
 
-        // Prepare egui frame BEFORE encoding GPU commands so UI edits apply on THIS frame!
         let (w, h, ppp, accum_frames, raw_input) = {
             let gfx = self.gfx.as_mut().expect("gfx checked");
             let w = gfx.surface_config.width.max(1);
@@ -1107,7 +1595,6 @@ impl StudioApp {
             ui_actions = self.build_ui(ui, w, h, ppp, accum_frames);
         });
 
-        // Apply UI actions before GPU dispatch.
         if let Some(next_mode) = ui_actions.switch_mode {
             self.switch_mode(next_mode);
         }
@@ -1149,17 +1636,15 @@ impl StudioApp {
             self.save_screenshot();
         }
 
-        // Adaptive drag vs settle state for fast 2D photon editing.
         if matches!(self.mode, StudioMode::Photons(_)) {
             let active_now =
                 self.drag.is_some() || self.photon_last_edit.elapsed() < Duration::from_millis(120);
-            if self.photon_was_dragging && !active_now {
-                // Transition from drag preview -> clean full-quality convergence.
-                if let Some(gfx) = &mut self.gfx
-                    && self.photon_settings.mode == PhotonMode::Accumulate
-                {
-                    gfx.photon_pipeline.clear_accumulation();
-                }
+            if self.photon_was_dragging
+                && !active_now
+                && let Some(gfx) = &mut self.gfx
+                && self.photon_settings.mode == PhotonMode::Accumulate
+            {
+                gfx.photon_pipeline.clear_accumulation();
             }
             self.photon_was_dragging = active_now;
             self.photon_settings.interactive_drag = active_now;
@@ -1194,7 +1679,6 @@ impl StudioApp {
                 label: Some("studio-frame-enc"),
             });
 
-        // 1. Render active simulation pass into swapchain texture.
         match self.mode {
             StudioMode::BlackHole3D => {
                 let (tw, th) = if self.bh_full_res {
@@ -1239,7 +1723,6 @@ impl StudioApp {
             }
         }
 
-        // 2. Render minimal egui overlay on top (LoadOp::Load preserves simulation pixels!).
         let screen_desc = ScreenDescriptor {
             size_in_pixels: [w, h],
             pixels_per_point: full_output.pixels_per_point,
@@ -1466,15 +1949,14 @@ impl ApplicationHandler for StudioApp {
                                 })
                                 .unwrap_or(0.015);
                             let pick_r = px_world * 18.0;
-                            let em_dist = ((world[0] - self.photon_scene.emitter_pos[0]).powi(2)
-                                + (world[1] - self.photon_scene.emitter_pos[1]).powi(2))
-                            .sqrt();
 
-                            if em_dist > pick_r
-                                && id.is_optics()
+                            if let Some(eidx) = self.photon_scene.hit_test_emitter(world, pick_r) {
+                                self.selection = Selection::Emitter(eidx);
+                                self.drag = Some(CanvasDrag::EmitterMove { idx: eidx });
+                            } else if id.is_optics()
                                 && let Some(idx) = self.photon_scene.hit_test_element(world, pick_r)
                             {
-                                self.selected_element = Some(idx);
+                                self.selection = Selection::Element(idx);
                                 if self.modifiers.shift_key() {
                                     self.drag = Some(CanvasDrag::ElementRotate { idx });
                                 } else {
@@ -1485,22 +1967,28 @@ impl ApplicationHandler for StudioApp {
                                     });
                                 }
                             } else {
-                                self.selected_element = None;
-                                self.drag = Some(CanvasDrag::EmitterMove);
-                                self.photon_scene.emitter_pos = world;
-                                self.mark_photon_edited(false, true);
+                                let eidx = self.active_emitter_idx();
+                                self.selection = Selection::Emitter(eidx);
+                                self.drag = Some(CanvasDrag::EmitterMove { idx: eidx });
+                                if let Some(em) = self.photon_scene.emitters.get_mut(eidx) {
+                                    em.pos = world;
+                                    self.mark_photon_edited(false, true);
+                                }
                             }
                         }
                     }
                     (StudioMode::Photons(_), MouseButton::Right) => {
-                        self.drag = Some(CanvasDrag::EmitterAim);
+                        let eidx = self.active_emitter_idx();
+                        self.selection = Selection::Emitter(eidx);
+                        self.drag = Some(CanvasDrag::EmitterAim { idx: eidx });
                         if let Some((cx, cy)) = self.last_cursor
                             && let Some(world) = self.cursor_to_world(cx, cy)
+                            && let Some(em) = self.photon_scene.emitters.get_mut(eidx)
                         {
-                            let dx = world[0] - self.photon_scene.emitter_pos[0];
-                            let dy = world[1] - self.photon_scene.emitter_pos[1];
+                            let dx = world[0] - em.pos[0];
+                            let dy = world[1] - em.pos[1];
                             if dx * dx + dy * dy > 1e-6 {
-                                self.photon_scene.emitter_angle = dy.atan2(dx);
+                                em.angle = dy.atan2(dx);
                                 self.mark_photon_edited(false, true);
                             }
                         }
@@ -1528,18 +2016,22 @@ impl ApplicationHandler for StudioApp {
                             self.bh_last_input = Instant::now();
                         }
                     }
-                    CanvasDrag::EmitterMove => {
-                        if let Some(world) = self.cursor_to_world(position.x, position.y) {
-                            self.photon_scene.emitter_pos = world;
+                    CanvasDrag::EmitterMove { idx } => {
+                        if let Some(world) = self.cursor_to_world(position.x, position.y)
+                            && let Some(em) = self.photon_scene.emitters.get_mut(idx)
+                        {
+                            em.pos = world;
                             self.mark_photon_edited(false, true);
                         }
                     }
-                    CanvasDrag::EmitterAim => {
-                        if let Some(world) = self.cursor_to_world(position.x, position.y) {
-                            let dx = world[0] - self.photon_scene.emitter_pos[0];
-                            let dy = world[1] - self.photon_scene.emitter_pos[1];
+                    CanvasDrag::EmitterAim { idx } => {
+                        if let Some(world) = self.cursor_to_world(position.x, position.y)
+                            && let Some(em) = self.photon_scene.emitters.get_mut(idx)
+                        {
+                            let dx = world[0] - em.pos[0];
+                            let dy = world[1] - em.pos[1];
                             if dx * dx + dy * dy > 1e-6 {
-                                self.photon_scene.emitter_angle = dy.atan2(dx);
+                                em.angle = dy.atan2(dx);
                                 self.mark_photon_edited(false, true);
                             }
                         }
@@ -1548,8 +2040,28 @@ impl ApplicationHandler for StudioApp {
                         if idx < self.photon_scene.elements.len()
                             && let Some(world) = self.cursor_to_world(position.x, position.y)
                         {
-                            self.photon_scene.elements[idx]
-                                .move_handle_to([world[0] + offset[0], world[1] + offset[1]]);
+                            let next = [world[0] + offset[0], world[1] + offset[1]];
+                            self.photon_scene.elements[idx].move_handle_to(next);
+                            // If dragging a planet, update its orbital radius/phase to match!
+                            if let ElementKind::Planet {
+                                orbit_radius,
+                                orbit_phase,
+                                parent_idx: None,
+                                ..
+                            } = &mut self.photon_scene.elements[idx].kind
+                                && *orbit_radius > 0.0
+                            {
+                                let sun = self
+                                    .photon_scene
+                                    .emitters
+                                    .first()
+                                    .map(|e| e.pos)
+                                    .unwrap_or([0.0, 0.0]);
+                                let dx = next[0] - sun[0];
+                                let dy = next[1] - sun[1];
+                                *orbit_radius = (dx * dx + dy * dy).sqrt().max(1.5);
+                                *orbit_phase = dy.atan2(dx);
+                            }
                             self.mark_photon_edited(true, true);
                         }
                     }
@@ -1615,11 +2127,54 @@ impl ApplicationHandler for StudioApp {
     }
 }
 
+fn spectrum_preview_color(spec: EmitterSpectrum) -> Color32 {
+    match spec {
+        EmitterSpectrum::WhiteFlat => Color32::from_rgb(242, 246, 255),
+        EmitterSpectrum::Blackbody(temp) => {
+            let t = ((temp - 2400.0) / 9600.0).clamp(0.0, 1.0);
+            if t < 0.35 {
+                let f = t / 0.35;
+                Color32::from_rgb(255, (130.0 + 112.0 * f) as u8, (55.0 + 150.0 * f) as u8)
+            } else {
+                let f = (t - 0.35) / 0.65;
+                Color32::from_rgb(
+                    (255.0 - 75.0 * f) as u8,
+                    (242.0 - 20.0 * f) as u8,
+                    (205.0 + 50.0 * f) as u8,
+                )
+            }
+        }
+        EmitterSpectrum::Laser(nm) => {
+            let [x, y, z] = cie_1931_xyz(f64::from(nm));
+            let r = (3.2404542 * x - 1.5371385 * y - 0.4985314 * z).max(0.0);
+            let g = (-0.9692660 * x + 1.8760108 * y + 0.0415560 * z).max(0.0);
+            let b = (0.0556434 * x - 0.2040259 * y + 1.0572252 * z).max(0.0);
+            let m = r.max(g).max(b).max(1e-6);
+            Color32::from_rgb(
+                ((r / m).powf(1.0 / 2.2) * 255.0) as u8,
+                ((g / m).powf(1.0 / 2.2) * 255.0) as u8,
+                ((b / m).powf(1.0 / 2.2) * 255.0) as u8,
+            )
+        }
+    }
+}
+
+fn card_frame() -> Frame {
+    Frame::new()
+        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 7))
+        .stroke(Stroke::new(
+            1.0,
+            Color32::from_rgba_unmultiplied(122, 186, 255, 65),
+        ))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(8))
+}
+
 fn apply_minimal_theme(ctx: &egui::Context) {
     let mut style = (*ctx.global_style()).clone();
-    style.spacing.item_spacing = Vec2::new(6.0, 6.0);
-    style.spacing.button_padding = Vec2::new(8.0, 4.0);
-    style.spacing.slider_width = 108.0;
+    style.spacing.item_spacing = Vec2::new(5.0, 6.0);
+    style.spacing.button_padding = Vec2::new(6.5, 3.8);
+    style.spacing.slider_width = 112.0;
     style.visuals = egui::Visuals::dark();
     style.visuals.slider_trailing_fill = true;
     style.visuals.override_text_color = Some(Color32::from_rgb(212, 220, 232));
@@ -1652,13 +2207,13 @@ fn apply_minimal_theme(ctx: &egui::Context) {
     style.visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(138, 196, 255));
     style
         .text_styles
-        .insert(TextStyle::Body, FontId::proportional(12.0));
+        .insert(TextStyle::Body, FontId::proportional(11.5));
     style
         .text_styles
-        .insert(TextStyle::Button, FontId::proportional(11.5));
+        .insert(TextStyle::Button, FontId::proportional(11.0));
     style
         .text_styles
-        .insert(TextStyle::Small, FontId::proportional(10.5));
+        .insert(TextStyle::Small, FontId::proportional(10.0));
     ctx.set_global_style(style);
 }
 
@@ -1673,7 +2228,7 @@ fn mode_chip(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
     } else {
         Stroke::NONE
     };
-    let text = RichText::new(label).size(11.5).color(if active {
+    let text = RichText::new(label).size(11.0).color(if active {
         Color32::from_rgb(242, 246, 252)
     } else {
         Color32::from_rgb(164, 174, 192)
@@ -1696,7 +2251,7 @@ fn section_label(ui: &mut egui::Ui, label: &str) {
 }
 
 fn pill_divider(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 14.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(5.0, 14.0), egui::Sense::hover());
     ui.painter().line_segment(
         [
             Pos2::new(rect.center().x, rect.top() + 2.0),

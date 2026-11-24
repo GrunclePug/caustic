@@ -1,17 +1,15 @@
 // Pass 1: Real-time forward spectral photon simulation supporting:
-// - PHYS_OPTICS (0): 2D flat-space dispersive optics (prisms, lenses, mirrors, absorbers)
+// - Multiple simultaneous physical emitters (Beam, Point, Spotlight, Star Disk) with
+//   White, Planck Blackbody (K), or Monochromatic Laser (nm) spectra
+// - PHYS_OPTICS (0): Dispersive glass (Cauchy/Snell/Fresnel/TIR), mirrors, 50/50 beam splitters,
+//   diffuse Lambertian surfaces/planets with spectral albedo, and Rayleigh (1/lambda^4) atmospheres
 // - PHYS_KERR (1): Equatorial Ingoing Cartesian Kerr-Schild curved spacetime
-// - PHYS_GRIN_LUNEBURG (2): Analytical Luneburg GRIN sphere n^2 = 1 + c*(1 - r^2/R^2)
-// - PHYS_GRIN_BH (3): Smooth chromatic inverse-square optical black hole n^2 = 1 + (b_c/r)^2
-// - PHYS_GRIN_MIRAGE (4): Exponential thermal atmospheric mirage above hot ground
-//
-// Deposits strictly non-negative CIE 1931 XYZ into a fixed-point atomic<u32> buffer with
-// unbiased stochastic strided arc-length splatting for high-FPS live editing and convergence.
+// - PHYS_GRIN_LUNEBURG (2), PHYS_GRIN_BH (3), PHYS_GRIN_MIRAGE (4): Continuous GRIN eikonal RK4
 
 struct SimUniforms {
     // xy = view_center, z = view_half_height, w = aspect (width / height)
     view: vec4<f32>,
-    // xy = emitter_pos, z = emitter_angle, w = emitter_spread
+    // x = total_power, yzw = reserved
     emitter: vec4<f32>,
     // x = dt_substep, y = spin a, z = r_plus, w = fixed_scale
     physics: vec4<f32>,
@@ -19,36 +17,42 @@ struct SimUniforms {
     extra: vec4<f32>,
     // x = width, y = height, z = active_photons, w = substeps
     dims: vec4<u32>,
-    // x = physics_kind, y = mode (0=Accumulate, 1=Pulse), z = emitter_kind, w = pulse_trigger
+    // x = physics_kind, y = mode (0=Accumulate, 1=Pulse), z = num_emitters, w = pulse_trigger
     flags: vec4<u32>,
     // x = num_segments, y = num_circles, z = frame_idx, w = seed
     counts: vec4<u32>,
 };
 
+struct GpuEmitter {
+    geom: vec4<f32>, // xy = pos, z = angle, w = spread/radius
+    spec: vec4<f32>, // x = spec_param (temp_k or lambda_nm), y = power, z = cdf_hi, w = reserved
+    info: vec4<u32>, // x = emitter_kind, y = spectrum_kind, zw = reserved
+};
+
 // 32-byte Photon state record (used persistently in MODE_PULSE).
 struct Photon {
     pos: vec2<f32>,
-    // Optics: unit direction d. Kerr: covariant spatial momentum (p_x, p_y). GRIN: eikonal p (|p| = n).
+    // Optics: unit direction d. Kerr: covariant spatial momentum. GRIN: eikonal p (|p| = n).
     p: vec2<f32>,
     // Optics & GRIN: wavelength in nm [380..780]. Kerr: emitted local ZAMO wavelength (nu_emit = 1).
     lambda_nm: f32,
-    // Optics: current medium IOR n_cur. Kerr: conserved energy E = -p_t. GRIN: 1.0.
+    // Optics: current medium IOR n_cur (or atmo_density when in_atmo bit set). Kerr: energy E = -p_t.
     energy: f32,
     rng: u32,
-    // bit 0: active, bits 2..32: bounces/age
+    // bit 0: active, bit 1: in_atmo, bits 2..6: emitter_idx (0..15), bits 6..32: bounces/age
     flags: u32,
 };
 
 struct OptSegment {
     endpoints: vec4<f32>, // xy = p0, zw = p1
-    material: vec4<f32>,  // x = cauchy_a, y = cauchy_b
-    info: vec4<u32>,      // x = mat_kind
+    material: vec4<f32>,  // Glass: (a, b). Diffuse/Splitter: (albedo_r, g, b, prob_refl)
+    info: vec4<u32>,      // x = mat_kind, y = subkind (1 = icy diffuse ring on splitter)
 };
 
 struct OptCircle {
     geom: vec4<f32>,     // xy = center, z = radius, w = clip_radius
     clip_arc: vec4<f32>, // xy = clip_center, z = arc_cos_half, w = arc_angle_center
-    material: vec4<f32>, // x = cauchy_a, y = cauchy_b
+    material: vec4<f32>, // Glass: (a, b). Diffuse: (r, g, b). Atmo: (density, n_delta, r_planet)
     info: vec4<u32>,     // x = mat_kind, y = invert_normal
 };
 
@@ -58,6 +62,7 @@ struct OptCircle {
 @group(0) @binding(3) var<storage, read> spectral_xyz_lut: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> segments: array<OptSegment>;
 @group(0) @binding(5) var<storage, read> circles: array<OptCircle>;
+@group(0) @binding(6) var<storage, read> emitters: array<GpuEmitter>;
 
 const PHYS_OPTICS: u32 = 0u;
 const PHYS_KERR: u32 = 1u;
@@ -68,15 +73,25 @@ const PHYS_GRIN_MIRAGE: u32 = 4u;
 const MAT_MIRROR: u32 = 1u;
 const MAT_GLASS: u32 = 2u;
 const MAT_ABSORBER: u32 = 3u;
+const MAT_DIFFUSE: u32 = 4u;
+const MAT_ATMOSPHERE: u32 = 5u;
+const MAT_SPLITTER: u32 = 6u;
 
 const EMITTER_BEAM: u32 = 0u;
+const EMITTER_POINT: u32 = 1u;
+const EMITTER_SPOT: u32 = 2u;
+const EMITTER_DISK: u32 = 3u;
+
+const SPEC_WHITE_FLAT: u32 = 0u;
+const SPEC_BLACKBODY: u32 = 1u;
+const SPEC_LASER: u32 = 2u;
 
 const MODE_ACCUMULATE: u32 = 0u;
 
 const LAMBDA_MIN: f32 = 380.0;
 const LAMBDA_MAX: f32 = 780.0;
+const TAU: f32 = 6.283185307;
 
-// GRIN geometry constants shared with photon_resolve.wgsl and grin.rs.
 const LUNEBURG_R: f32 = 3.2;
 const OPT_BH_BC_BASE: f32 = 2.4;
 const OPT_BH_CORE_R: f32 = 0.72;
@@ -109,6 +124,56 @@ fn sample_spectral_xyz(lambda_nm: f32) -> vec3<f32> {
     let i0 = min(u32(pos), 254u);
     let frac = pos - f32(i0);
     return mix(spectral_xyz_lut[i0].xyz, spectral_xyz_lut[i0 + 1u].xyz, frac);
+}
+
+// Exact Planck spectral radiance in nm, normalized over [380, 780] nm.
+fn planck_raw(lambda_nm: f32, temp_k: f32) -> f32 {
+    let lam = clamp(lambda_nm, 380.0, 780.0);
+    let t = clamp(temp_k, 1500.0, 25000.0);
+    let x = clamp(1.4387769e7 / (lam * t), 1e-4, 60.0);
+    let inv = 550.0 / lam;
+    let p5 = inv * inv * inv * inv * inv;
+    return p5 / max(exp(x) - 1.0, 1e-6);
+}
+
+fn planck_visible_weight(lambda_nm: f32, temp_k: f32) -> f32 {
+    var sum = 0.0;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let l = 405.0 + f32(i) * 50.0;
+        sum = sum + planck_raw(l, temp_k);
+    }
+    let avg = max(sum * 0.125, 1e-20);
+    return planck_raw(lambda_nm, temp_k) / avg;
+}
+
+fn emitter_spectral_weight(em_idx: u32, lambda_nm: f32) -> f32 {
+    let em = emitters[em_idx];
+    let sk = em.info.y;
+    if (sk == SPEC_BLACKBODY) {
+        return planck_visible_weight(lambda_nm, em.spec.x);
+    }
+    if (sk == SPEC_LASER) {
+        return 0.55;
+    }
+    return 1.0;
+}
+
+// Smooth physical spectral reflectance R(lambda) in [0, 0.96] from RGB albedo weights.
+fn spectral_albedo(lambda_nm: f32, albedo: vec3<f32>) -> f32 {
+    let db = (lambda_nm - 450.0) / 55.0;
+    let dg = (lambda_nm - 545.0) / 55.0;
+    let dr = (lambda_nm - 635.0) / 65.0;
+    let wb = exp(-0.5 * db * db);
+    let wg = exp(-0.5 * dg * dg);
+    let wr = exp(-0.5 * dr * dr);
+    let denom = max(wb + wg + wr, 1e-5);
+    return clamp((albedo.r * wr + albedo.g * wg + albedo.b * wb) / denom, 0.0, 0.96);
+}
+
+fn rayleigh_sigma(lambda_nm: f32, base_density: f32) -> f32 {
+    let ratio = 550.0 / clamp(lambda_nm, 380.0, 780.0);
+    let r2 = ratio * ratio;
+    return max(base_density, 0.0) * r2 * r2;
 }
 
 fn cauchy_ior(lambda_nm: f32, a: f32, b: f32) -> f32 {
@@ -147,9 +212,6 @@ fn splat_pixel_xyz(ix: i32, iy: i32, xyz: vec3<f32>) {
     }
 }
 
-// Liang-Barsky screen-clipped, unbiased stochastic strided spectral segment splat.
-// Stepping by `stride` pixels with random phase `jitter in [0, 1)` and weighting by `step_px`
-// keeps expected irradiance strictly unbiased while slashing L2 atomic contention by ~stride-x.
 fn splat_segment_xyz(w0: vec2<f32>, w1: vec2<f32>, xyz: vec3<f32>, density_w: f32, jitter: f32) {
     let s0 = world_to_pixel(w0);
     let s1 = world_to_pixel(w1);
@@ -244,7 +306,6 @@ fn eval_grin(phys: u32, pos: vec2<f32>, lambda_nm: f32) -> GrinEval {
         return GrinEval(n2, -(bc2 / (r2 * r2)) * pos);
     }
 
-    // PHYS_GRIN_MIRAGE
     let n_air = max(1.08 + 0.045 * disp * chi, 1.01);
     let amp = clamp(0.30 * strength * (1.0 + 0.22 * disp * chi), 0.02, n_air * n_air - 0.25);
     let dy = max(pos.y - MIRAGE_Y_GROUND, 0.0);
@@ -261,6 +322,20 @@ fn grin_absorbed(phys: u32, pos: vec2<f32>) -> bool {
         return pos.y <= MIRAGE_Y_GROUND;
     }
     return false;
+}
+
+fn grin_rk4_step(phys: u32, pos0: vec2<f32>, p0: vec2<f32>, lambda_nm: f32, h: f32) -> vec4<f32> {
+    let g1 = eval_grin(phys, pos0, lambda_nm).half_grad_n2;
+    let p2 = p0 + 0.5 * h * g1;
+    let g2 = eval_grin(phys, pos0 + 0.5 * h * p0, lambda_nm).half_grad_n2;
+    let p3 = p0 + 0.5 * h * g2;
+    let g3 = eval_grin(phys, pos0 + 0.5 * h * p2, lambda_nm).half_grad_n2;
+    let p4 = p0 + h * g3;
+    let g4 = eval_grin(phys, pos0 + h * p3, lambda_nm).half_grad_n2;
+
+    let pos1 = pos0 + (h / 6.0) * (p0 + 2.0 * p2 + 2.0 * p3 + p4);
+    let p1 = p0 + (h / 6.0) * (g1 + 2.0 * g2 + 2.0 * g3 + g4);
+    return vec4<f32>(pos1.x, pos1.y, p1.x, p1.y);
 }
 
 // ---------- Ingoing Cartesian Kerr-Schild Equatorial (z = 0) Physics ----------
@@ -364,18 +439,18 @@ fn kerr_spectral_xyz(lambda_emit: f32, nu_loc: f32) -> vec4<f32> {
     return vec4<f32>(xyz, energy_boost);
 }
 
-// ---------- Flat-Space Optical Intersection Helpers ----------
+// ---------- Flat-Space Optical & Planetary Intersection Helpers ----------
 
 struct HitInfo {
     t: f32,
     normal: vec2<f32>,
     mat_kind: u32,
-    cauchy_a: f32,
-    cauchy_b: f32,
+    subkind: u32,
+    mat: vec4<f32>,
 };
 
 fn intersect_scene(pos: vec2<f32>, dir: vec2<f32>, t_max: f32) -> HitInfo {
-    var best = HitInfo(t_max + 1.0, vec2<f32>(0.0, 1.0), 0u, 1.0, 0.0);
+    var best = HitInfo(t_max + 1.0, vec2<f32>(0.0, 1.0), 0u, 0u, vec4<f32>(1.0, 0.0, 0.0, 0.0));
 
     let n_seg = u.counts.x;
     for (var i = 0u; i < n_seg; i = i + 1u) {
@@ -392,7 +467,7 @@ fn intersect_scene(pos: vec2<f32>, dir: vec2<f32>, t_max: f32) -> HitInfo {
         let s = (ap.x * dir.y - ap.y * dir.x) / denom;
         if (t > 1e-6 && t < best.t && s >= 0.0 && s <= 1.0) {
             let n = normalize(vec2<f32>(e.y, -e.x));
-            best = HitInfo(t, n, seg.info.x, seg.material.x, seg.material.y);
+            best = HitInfo(t, n, seg.info.x, seg.info.y, seg.material);
         }
     }
 
@@ -435,34 +510,92 @@ fn intersect_scene(pos: vec2<f32>, dir: vec2<f32>, t_max: f32) -> HitInfo {
                 }
             }
             let n = select(n_out, -n_out, cir.info.y != 0u);
-            best = HitInfo(t, n, cir.info.x, cir.material.x, cir.material.y);
+            best = HitInfo(t, n, cir.info.x, 0u, cir.material);
         }
     }
 
     return best;
 }
 
+fn lambertian_reflect(n_in: vec2<f32>, dir: vec2<f32>, rng: ptr<function, u32>) -> vec2<f32> {
+    var n = n_in;
+    if (dot(dir, n) > 0.0) {
+        n = -n;
+    }
+    let sin_a = rand_f32(rng) * 2.0 - 1.0;
+    let cos_a = sqrt(max(1.0 - sin_a * sin_a, 0.0));
+    let tang = vec2<f32>(-n.y, n.x);
+    return normalize(n * cos_a + tang * sin_a);
+}
+
+fn rayleigh_scatter_dir(dir: vec2<f32>, rng: ptr<function, u32>) -> vec2<f32> {
+    // 2D Rayleigh dipole phase function P(theta) proportional to 1 + cos^2(theta).
+    var theta = rand_f32(rng) * TAU;
+    let c = cos(theta);
+    if (rand_f32(rng) > 0.5 * (1.0 + c * c)) {
+        theta = rand_f32(rng) * TAU;
+    }
+    let ct = cos(theta);
+    let st = sin(theta);
+    return normalize(vec2<f32>(dir.x * ct - dir.y * st, dir.x * st + dir.y * ct));
+}
+
 fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
-    let base_ang = u.emitter.z;
-    let spread = u.emitter.w;
     let phys = u.flags.x;
-    let emitter_kind = u.flags.z;
+    let n_em = max(u.flags.z, 1u);
+
+    // Stratified emitter selection across gid proportional to emitter power CDF.
+    let u_gid = (f32(gid) + 0.5) / f32(u.dims.z);
+    var em_idx = 0u;
+    var cdf_lo = 0.0;
+    var cdf_hi = 1.0;
+    for (var i = 0u; i < n_em; i = i + 1u) {
+        let hi = emitters[i].spec.z;
+        if (u_gid <= hi || i + 1u == n_em) {
+            em_idx = i;
+            cdf_hi = hi;
+            break;
+        }
+        cdf_lo = hi;
+    }
+
+    let em = emitters[em_idx];
+    let local_u = clamp((u_gid - cdf_lo) / max(cdf_hi - cdf_lo, 1e-6), 0.0, 0.999999);
+    let base_ang = em.geom.z;
+    let spread = em.geom.w;
+    let em_kind = em.info.x;
+    let spec_kind = em.info.y;
 
     let r0 = rand_f32(rng);
     let r1 = rand_f32(rng);
+    let r2 = rand_f32(rng);
 
-    var pos = u.emitter.xy;
+    var pos = em.geom.xy;
     var aim = vec2<f32>(cos(base_ang), sin(base_ang));
 
-    if (emitter_kind == EMITTER_BEAM) {
+    if (em_kind == EMITTER_BEAM) {
         let perp = vec2<f32>(-aim.y, aim.x);
-        let lane = ((f32(gid) + r0) / f32(u.dims.z)) * 2.0 - 1.0;
-        pos = pos + perp * (lane * spread);
-    } else {
-        let ang_off = (((f32(gid) + r0) / f32(u.dims.z)) * 2.0 - 1.0) * spread;
+        let lane = (local_u + (r0 - 0.5) / max(f32(u.dims.z) * (cdf_hi - cdf_lo), 1.0)) * 2.0 - 1.0;
+        pos = pos + perp * (clamp(lane, -1.0, 1.0) * spread);
+    } else if (em_kind == EMITTER_POINT) {
+        let ang = local_u * TAU + (r0 - 0.5) * 0.02;
+        aim = vec2<f32>(cos(ang), sin(ang));
+    } else if (em_kind == EMITTER_SPOT) {
+        let ang_off = (local_u * 2.0 - 1.0) * spread + (r0 - 0.5) * 0.004;
         let ang = base_ang + ang_off;
         aim = vec2<f32>(cos(ang), sin(ang));
+    } else {
+        // EMITTER_DISK: glowing physical star/Sun photosphere casting real umbra & soft penumbra!
+        let rim_ang = local_u * TAU + r0 * 0.02;
+        let out_n = vec2<f32>(cos(rim_ang), sin(rim_ang));
+        pos = pos + out_n * (max(spread, 0.05) + 1e-3);
+        let tang = vec2<f32>(-out_n.y, out_n.x);
+        let sin_rel = select(r2 * 2.0 - 1.0, (r2 * 2.0 - 1.0) * 0.35, u.flags.y != MODE_ACCUMULATE);
+        let cos_rel = sqrt(max(1.0 - sin_rel * sin_rel, 0.0));
+        aim = normalize(out_n * cos_rel + tang * sin_rel);
     }
+
+    let base_flags = 1u | ((em_idx & 15u) << 2u);
 
     if (phys == PHYS_KERR) {
         let a = u.physics.y;
@@ -475,10 +608,14 @@ fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
         let energy = ep.x;
         let p = ep.yz;
         let lambda_emit = mix(585.0, 610.0, r1);
-        return Photon(pos, p, lambda_emit, energy, *rng, 1u);
+        return Photon(pos, p, lambda_emit, energy, *rng, base_flags);
     }
 
-    let lambda_nm = mix(LAMBDA_MIN, LAMBDA_MAX, r1);
+    var lambda_nm = mix(LAMBDA_MIN, LAMBDA_MAX, r1);
+    if (spec_kind == SPEC_LASER) {
+        lambda_nm = clamp(em.spec.x + (r1 - 0.5) * 4.0, LAMBDA_MIN, LAMBDA_MAX);
+    }
+
     if (phys >= PHYS_GRIN_LUNEBURG) {
         if (phys == PHYS_GRIN_BH && length(pos) <= OPT_BH_CORE_R * 1.15) {
             pos = normalize(pos + vec2<f32>(1e-4, 0.0)) * (OPT_BH_CORE_R * 1.35);
@@ -488,24 +625,10 @@ fn spawn_photon(gid: u32, rng: ptr<function, u32>) -> Photon {
         }
         let ge = eval_grin(phys, pos, lambda_nm);
         let p = aim * sqrt(max(ge.n2, 0.1));
-        return Photon(pos, p, lambda_nm, 1.0, *rng, 1u);
+        return Photon(pos, p, lambda_nm, 1.0, *rng, base_flags);
     }
 
-    return Photon(pos, aim, lambda_nm, 1.0, *rng, 1u);
-}
-
-fn grin_rk4_step(phys: u32, pos0: vec2<f32>, p0: vec2<f32>, lambda_nm: f32, h: f32) -> vec4<f32> {
-    let g1 = eval_grin(phys, pos0, lambda_nm).half_grad_n2;
-    let p2 = p0 + 0.5 * h * g1;
-    let g2 = eval_grin(phys, pos0 + 0.5 * h * p0, lambda_nm).half_grad_n2;
-    let p3 = p0 + 0.5 * h * g2;
-    let g3 = eval_grin(phys, pos0 + 0.5 * h * p2, lambda_nm).half_grad_n2;
-    let p4 = p0 + h * g3;
-    let g4 = eval_grin(phys, pos0 + h * p3, lambda_nm).half_grad_n2;
-
-    let pos1 = pos0 + (h / 6.0) * (p0 + 2.0 * p2 + 2.0 * p3 + p4);
-    let p1 = p0 + (h / 6.0) * (g1 + 2.0 * g2 + 2.0 * g3 + g4);
-    return vec4<f32>(pos1.x, pos1.y, p1.x, p1.y);
+    return Photon(pos, aim, lambda_nm, 1.0, *rng, base_flags);
 }
 
 @compute @workgroup_size(256, 1, 1)
@@ -530,6 +653,7 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
         var rng = hash_u32(gid ^ hash_u32(u.counts.z * 0x9E3779B9u ^ hash_u32(u.counts.w)));
         let _w0 = pcg_next(&rng);
         var ph = spawn_photon(gid, &rng);
+        let em_idx = (ph.flags >> 2u) & 15u;
 
         if (phys == PHYS_KERR) {
             let a = u.physics.y;
@@ -567,9 +691,8 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                 }
             }
         } else if (phys >= PHYS_GRIN_LUNEBURG) {
-            let xyz = sample_spectral_xyz(ph.lambda_nm);
-            // Randomize RK4 step phase slightly per photon to eliminate discrete boundary aliasing
-            // at the Luneburg sphere rim (where grad(n^2) turns on linearly).
+            let spec_w = emitter_spectral_weight(em_idx, ph.lambda_nm);
+            let xyz = sample_spectral_xyz(ph.lambda_nm) * spec_w;
             let h_jit = mix(0.82, 1.18, rand_f32(&rng));
             for (var step = 0u; step < 440u; step = step + 1u) {
                 let pos0 = ph.pos;
@@ -602,12 +725,31 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                 }
             }
         } else {
-            // PHYS_OPTICS: exact straight-line multi-bounce dispersive optics.
-            let xyz = sample_spectral_xyz(ph.lambda_nm);
+            // PHYS_OPTICS: full playground (glass, mirrors, beam splitters, diffuse surfaces,
+            // planetary Rayleigh atmospheres, and absorbers).
+            let spec_w = emitter_spectral_weight(em_idx, ph.lambda_nm);
+            let xyz = sample_spectral_xyz(ph.lambda_nm) * spec_w;
             let max_dist = length(vec2<f32>(bound_x, bound_y)) * 2.5;
+            var in_atmo = false;
+            var atmo_density = 0.0;
 
-            for (var bounce = 0u; bounce < 24u; bounce = bounce + 1u) {
+            for (var bounce = 0u; bounce < 28u; bounce = bounce + 1u) {
                 let hit = intersect_scene(ph.pos, ph.p, max_dist);
+                let seg_len = select(max_dist, hit.t, hit.t <= max_dist);
+
+                // Beer-Lambert + Rayleigh (1 / lambda^4) scattering inside planetary atmospheres!
+                if (in_atmo && atmo_density > 0.0) {
+                    let sigma = rayleigh_sigma(ph.lambda_nm, atmo_density);
+                    let s_scat = -log(max(1.0 - rand_f32(&rng), 1e-6)) / max(sigma, 1e-6);
+                    if (s_scat < seg_len) {
+                        let scat_pos = ph.pos + ph.p * s_scat;
+                        splat_segment_xyz(ph.pos, scat_pos, xyz, 1.0, rand_f32(&rng));
+                        ph.pos = scat_pos;
+                        ph.p = rayleigh_scatter_dir(ph.p, &rng);
+                        continue;
+                    }
+                }
+
                 if (hit.t <= max_dist) {
                     let hit_pos = ph.pos + ph.p * hit.t;
                     splat_segment_xyz(ph.pos, hit_pos, xyz, 1.0, rand_f32(&rng));
@@ -624,7 +766,7 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                     } else if (hit.mat_kind == MAT_GLASS) {
                         let entering = dot(ph.p, hit.normal) < 0.0;
                         let n_face = select(-hit.normal, hit.normal, entering);
-                        let n_glass = cauchy_ior(ph.lambda_nm, hit.cauchy_a, hit.cauchy_b);
+                        let n_glass = cauchy_ior(ph.lambda_nm, hit.mat.x, hit.mat.y);
                         let n1 = select(n_glass, 1.0, entering);
                         let n2 = select(1.0, n_glass, entering);
                         let cos_i = clamp(-dot(ph.p, n_face), 0.0, 1.0);
@@ -647,6 +789,64 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                         } else {
                             ph.p = refr_dir;
                             ph.pos = hit_pos - n_face * 5e-5;
+                        }
+                    } else if (hit.mat_kind == MAT_DIFFUSE) {
+                        let refl = spectral_albedo(ph.lambda_nm, hit.mat.xyz);
+                        if (rand_f32(&rng) < refl) {
+                            var n = hit.normal;
+                            if (dot(ph.p, n) > 0.0) {
+                                n = -n;
+                            }
+                            ph.p = lambertian_reflect(n, ph.p, &rng);
+                            ph.pos = hit_pos + n * 1e-4;
+                        } else {
+                            break;
+                        }
+                    } else if (hit.mat_kind == MAT_ATMOSPHERE) {
+                        let entering = dot(ph.p, hit.normal) < 0.0;
+                        let n_face = select(-hit.normal, hit.normal, entering);
+                        // Gentle physical atmospheric limb refraction (bends grazing sunset light into umbra).
+                        let n_atmo = 1.0 + hit.mat.y;
+                        let n1 = select(n_atmo, 1.0, entering);
+                        let n2 = select(1.0, n_atmo, entering);
+                        let cos_i = clamp(-dot(ph.p, n_face), 0.0, 1.0);
+                        let eta = n1 / n2;
+                        let sin2_t = eta * eta * max(1.0 - cos_i * cos_i, 0.0);
+                        if (sin2_t < 1.0) {
+                            let cos_t = sqrt(max(1.0 - sin2_t, 0.0));
+                            ph.p = normalize(eta * ph.p + (eta * cos_i - cos_t) * n_face);
+                            ph.pos = hit_pos - n_face * 1e-4;
+                            in_atmo = entering;
+                            atmo_density = select(0.0, hit.mat.x, entering);
+                        } else {
+                            ph.pos = hit_pos + ph.p * 2e-4;
+                            in_atmo = false;
+                            atmo_density = 0.0;
+                        }
+                    } else if (hit.mat_kind == MAT_SPLITTER) {
+                        let prob_refl = hit.mat.w;
+                        if (rand_f32(&rng) < prob_refl) {
+                            var n = hit.normal;
+                            if (dot(ph.p, n) > 0.0) {
+                                n = -n;
+                            }
+                            if (hit.subkind == 1u) {
+                                // Translucent icy planetary ring: spectral scatter or absorb.
+                                let alb = spectral_albedo(ph.lambda_nm, hit.mat.xyz);
+                                if (rand_f32(&rng) < alb) {
+                                    ph.p = lambertian_reflect(n, ph.p, &rng);
+                                    ph.pos = hit_pos + n * 1e-4;
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                // Clean 50/50 optical beam splitter specular reflection.
+                                ph.p = normalize(ph.p - 2.0 * dot(ph.p, n) * n);
+                                ph.pos = hit_pos + n * 5e-5;
+                            }
+                        } else {
+                            // Transmit straight through!
+                            ph.pos = hit_pos + ph.p * 2e-4;
                         }
                     }
 
@@ -678,6 +878,8 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
         photons[gid] = ph;
         return;
     }
+
+    let em_idx = (ph.flags >> 2u) & 15u;
 
     if (phys == PHYS_KERR) {
         let a = u.physics.y;
@@ -715,16 +917,17 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
 
             ph.pos = pos1;
             ph.p = p1;
-            let age = (ph.flags >> 2u) + 1u;
+            let age = (ph.flags >> 6u) + 1u;
             let rel = abs(pos1 - u.view.xy);
             if (rel.x > bound_x || rel.y > bound_y || age > 4000u) {
                 ph.flags = ph.flags & (~1u);
             } else {
-                ph.flags = (ph.flags & 3u) | (age << 2u);
+                ph.flags = (ph.flags & 63u) | (age << 6u);
             }
         }
     } else if (phys >= PHYS_GRIN_LUNEBURG) {
-        let xyz = sample_spectral_xyz(ph.lambda_nm);
+        let spec_w = emitter_spectral_weight(em_idx, ph.lambda_nm);
+        let xyz = sample_spectral_xyz(ph.lambda_nm) * spec_w;
         for (var s = 0u; s < substeps; s = s + 1u) {
             if ((ph.flags & 1u) == 0u) {
                 break;
@@ -732,7 +935,6 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
             let pos0 = ph.pos;
             let p0 = ph.p;
             let ge = eval_grin(phys, pos0, ph.lambda_nm);
-            // Physical coordinate time dt = n^2 * dtau -> exact c / n(x, lambda) wavefront slowing!
             let h_time = dt_step / max(ge.n2, 0.25);
             let h_safe = select(0.08, clamp(0.03 * length(pos0) / sqrt(max(ge.n2, 0.25)), 0.004, 0.08), phys == PHYS_GRIN_BH);
             let h = min(h_time, h_safe);
@@ -749,28 +951,44 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
             splat_segment_xyz(pos0, pos1, xyz, 1.0, rand_f32(&rng));
             ph.pos = pos1;
             ph.p = p1;
-            let age = (ph.flags >> 2u) + 1u;
+            let age = (ph.flags >> 6u) + 1u;
             let rel = abs(pos1 - u.view.xy);
             if (rel.x > bound_x || rel.y > bound_y || age > 4000u) {
                 ph.flags = ph.flags & (~1u);
             } else {
-                ph.flags = (ph.flags & 3u) | (age << 2u);
+                ph.flags = (ph.flags & 63u) | (age << 6u);
             }
         }
     } else {
+        let spec_w = emitter_spectral_weight(em_idx, ph.lambda_nm);
+        let xyz = sample_spectral_xyz(ph.lambda_nm) * spec_w;
         for (var s = 0u; s < substeps; s = s + 1u) {
             if ((ph.flags & 1u) == 0u) {
                 break;
             }
-            let xyz = sample_spectral_xyz(ph.lambda_nm);
             var rem_t = dt_step;
             for (var bounce_iter = 0u; bounce_iter < 4u; bounce_iter = bounce_iter + 1u) {
                 if (rem_t <= 1e-5 || (ph.flags & 1u) == 0u) {
                     break;
                 }
-                let n_cur = max(ph.energy, 1.0);
+                let in_atmo = (ph.flags & 2u) != 0u;
+                let n_cur = select(max(ph.energy, 1.0), 1.0, in_atmo);
                 let dist_budget = rem_t / n_cur;
                 let hit = intersect_scene(ph.pos, ph.p, dist_budget + 2e-6);
+                let seg_len = select(dist_budget, min(hit.t, dist_budget), hit.t <= dist_budget + 2e-6);
+
+                if (in_atmo && ph.energy > 0.0) {
+                    let sigma = rayleigh_sigma(ph.lambda_nm, ph.energy);
+                    let s_scat = -log(max(1.0 - rand_f32(&rng), 1e-6)) / max(sigma, 1e-6);
+                    if (s_scat < seg_len) {
+                        let scat_pos = ph.pos + ph.p * s_scat;
+                        splat_segment_xyz(ph.pos, scat_pos, xyz, 1.0, rand_f32(&rng));
+                        ph.pos = scat_pos;
+                        ph.p = rayleigh_scatter_dir(ph.p, &rng);
+                        rem_t = max(rem_t - s_scat, 0.0);
+                        continue;
+                    }
+                }
 
                 if (hit.t <= dist_budget + 2e-6) {
                     let hit_t = min(hit.t, dist_budget);
@@ -791,7 +1009,7 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                     } else if (hit.mat_kind == MAT_GLASS) {
                         let entering = dot(ph.p, hit.normal) < 0.0;
                         let n_face = select(-hit.normal, hit.normal, entering);
-                        let n_glass = cauchy_ior(ph.lambda_nm, hit.cauchy_a, hit.cauchy_b);
+                        let n_glass = cauchy_ior(ph.lambda_nm, hit.mat.x, hit.mat.y);
                         let n1 = select(n_glass, 1.0, entering);
                         let n2 = select(1.0, n_glass, entering);
                         let cos_i = clamp(-dot(ph.p, n_face), 0.0, 1.0);
@@ -817,14 +1035,76 @@ fn main(@builtin(global_invocation_id) gid_v: vec3<u32>) {
                             ph.pos = hit_pos - n_face * 5e-5;
                             ph.energy = n2;
                         }
+                        ph.flags = ph.flags & (~2u);
+                    } else if (hit.mat_kind == MAT_DIFFUSE) {
+                        let refl = spectral_albedo(ph.lambda_nm, hit.mat.xyz);
+                        if (rand_f32(&rng) < refl) {
+                            var n = hit.normal;
+                            if (dot(ph.p, n) > 0.0) {
+                                n = -n;
+                            }
+                            ph.p = lambertian_reflect(n, ph.p, &rng);
+                            ph.pos = hit_pos + n * 1e-4;
+                        } else {
+                            ph.flags = ph.flags & (~1u);
+                            break;
+                        }
+                    } else if (hit.mat_kind == MAT_ATMOSPHERE) {
+                        let entering = dot(ph.p, hit.normal) < 0.0;
+                        let n_face = select(-hit.normal, hit.normal, entering);
+                        let n_atmo = 1.0 + hit.mat.y;
+                        let n1 = select(n_atmo, 1.0, entering);
+                        let n2 = select(1.0, n_atmo, entering);
+                        let cos_i = clamp(-dot(ph.p, n_face), 0.0, 1.0);
+                        let eta = n1 / n2;
+                        let sin2_t = eta * eta * max(1.0 - cos_i * cos_i, 0.0);
+                        if (sin2_t < 1.0) {
+                            let cos_t = sqrt(max(1.0 - sin2_t, 0.0));
+                            ph.p = normalize(eta * ph.p + (eta * cos_i - cos_t) * n_face);
+                            ph.pos = hit_pos - n_face * 1e-4;
+                            if (entering) {
+                                ph.flags = ph.flags | 2u;
+                                ph.energy = hit.mat.x;
+                            } else {
+                                ph.flags = ph.flags & (~2u);
+                                ph.energy = 1.0;
+                            }
+                        } else {
+                            ph.pos = hit_pos + ph.p * 2e-4;
+                            ph.flags = ph.flags & (~2u);
+                            ph.energy = 1.0;
+                        }
+                    } else if (hit.mat_kind == MAT_SPLITTER) {
+                        let prob_refl = hit.mat.w;
+                        if (rand_f32(&rng) < prob_refl) {
+                            var n = hit.normal;
+                            if (dot(ph.p, n) > 0.0) {
+                                n = -n;
+                            }
+                            if (hit.subkind == 1u) {
+                                let alb = spectral_albedo(ph.lambda_nm, hit.mat.xyz);
+                                if (rand_f32(&rng) < alb) {
+                                    ph.p = lambertian_reflect(n, ph.p, &rng);
+                                    ph.pos = hit_pos + n * 1e-4;
+                                } else {
+                                    ph.flags = ph.flags & (~1u);
+                                    break;
+                                }
+                            } else {
+                                ph.p = normalize(ph.p - 2.0 * dot(ph.p, n) * n);
+                                ph.pos = hit_pos + n * 5e-5;
+                            }
+                        } else {
+                            ph.pos = hit_pos + ph.p * 2e-4;
+                        }
                     }
 
-                    let bounces = (ph.flags >> 2u) + 1u;
+                    let bounces = (ph.flags >> 6u) + 1u;
                     if (bounces > 32u) {
                         ph.flags = ph.flags & (~1u);
                         break;
                     }
-                    ph.flags = (ph.flags & 3u) | (bounces << 2u);
+                    ph.flags = (ph.flags & 63u) | (bounces << 6u);
                 } else {
                     let next_pos = ph.pos + ph.p * dist_budget;
                     splat_segment_xyz(ph.pos, next_pos, xyz, 1.0, rand_f32(&rng));

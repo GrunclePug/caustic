@@ -1,6 +1,6 @@
 // Pass 2: Resolve fixed-point atomic<u32> spectral CIE XYZ buffer into linear Rec.709 HDR,
 // clear atomic deposits for the next frame, apply accumulation or pulse persistence decay,
-// and draw subtle optical element, GRIN medium, or Kerr horizon-ergosphere guides.
+// and draw subtle optical element, planetary body, star disk, GRIN, or Kerr guides.
 
 struct ResolveUniforms {
     // xy = view_center, z = view_half_height, w = aspect
@@ -11,7 +11,7 @@ struct ResolveUniforms {
     kerr: vec4<f32>,
     // x = width, y = height, z = physics_kind, w = mode (0=Accumulate, 1=Pulse)
     dims: vec4<u32>,
-    // x = num_segments, y = num_circles, z = clear_hdr (0/1), w = reserved
+    // x = num_segments, y = num_circles, z = clear_hdr (0/1), w = num_emitters
     counts: vec4<u32>,
 };
 
@@ -28,12 +28,19 @@ struct OptCircle {
     info: vec4<u32>,
 };
 
+struct GpuEmitter {
+    geom: vec4<f32>,
+    spec: vec4<f32>,
+    info: vec4<u32>,
+};
+
 @group(0) @binding(0) var<uniform> u: ResolveUniforms;
 @group(0) @binding(1) var<storage, read_write> accum_xyz: array<u32>;
 @group(0) @binding(2) var<storage, read_write> hdr_accum: array<vec4<f32>>;
 @group(0) @binding(3) var hdr_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var<storage, read> segments: array<OptSegment>;
 @group(0) @binding(5) var<storage, read> circles: array<OptCircle>;
+@group(0) @binding(6) var<storage, read> emitters: array<GpuEmitter>;
 
 const PHYS_OPTICS: u32 = 0u;
 const PHYS_KERR: u32 = 1u;
@@ -43,6 +50,12 @@ const PHYS_GRIN_MIRAGE: u32 = 4u;
 
 const MAT_MIRROR: u32 = 1u;
 const MAT_ABSORBER: u32 = 3u;
+const MAT_DIFFUSE: u32 = 4u;
+const MAT_ATMOSPHERE: u32 = 5u;
+const MAT_SPLITTER: u32 = 6u;
+
+const EMITTER_DISK: u32 = 3u;
+const SPEC_BLACKBODY: u32 = 1u;
 
 const LUNEBURG_R: f32 = 3.2;
 const OPT_BH_BC_BASE: f32 = 2.4;
@@ -70,6 +83,14 @@ fn dist_to_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     let ab = b - a;
     let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-10), 0.0, 1.0);
     return length(p - (a + ab * t));
+}
+
+fn star_color_tint(temp_k: f32) -> vec3<f32> {
+    let t = clamp((temp_k - 2500.0) / 9500.0, 0.0, 1.0);
+    let warm = vec3<f32>(1.0, 0.45, 0.15);
+    let sun = vec3<f32>(1.0, 0.94, 0.80);
+    let hot = vec3<f32>(0.70, 0.86, 1.0);
+    return select(mix(sun, hot, (t - 0.35) / 0.65), mix(warm, sun, t / 0.35), t < 0.35);
 }
 
 fn scene_overlay(world: vec2<f32>, px_world: f32) -> vec3<f32> {
@@ -119,20 +140,44 @@ fn scene_overlay(world: vec2<f32>, px_world: f32) -> vec3<f32> {
         return col;
     }
 
-    // PHYS_OPTICS wireframe guides for glass, mirrors, and beam stops.
+    // Glowing star / Sun disks for EMITTER_DISK emitters.
+    for (var i = 0u; i < u.counts.w; i = i + 1u) {
+        let em = emitters[i];
+        if (em.info.x == EMITTER_DISK) {
+            let r = length(world - em.geom.xy);
+            let rad = max(em.geom.w, 0.05);
+            let tint = select(vec3<f32>(1.0, 0.96, 0.88), star_color_tint(em.spec.x), em.info.y == SPEC_BLACKBODY);
+            if (r <= rad) {
+                let mu = sqrt(max(1.0 - (r * r) / (rad * rad), 0.0));
+                // Subtle physical limb darkening across the solar photosphere.
+                let limb = 0.45 + 0.55 * mu;
+                col = col + tint * (3.8 * limb);
+            } else {
+                let d = r - rad;
+                col = col + tint * (0.45 * exp(-d / (rad * 0.28)));
+            }
+        }
+    }
+
+    // Optical segments: glass, mirrors, beam splitters, icy rings, matte walls, absorbers.
     for (var i = 0u; i < u.counts.x; i = i + 1u) {
         let seg = segments[i];
         let d = dist_to_segment(world, seg.endpoints.xy, seg.endpoints.zw);
         let alpha = exp(-(d * d) / (line_w * line_w));
         var tint = vec3<f32>(0.08, 0.16, 0.24);
         if (seg.info.x == MAT_MIRROR) {
-            tint = vec3<f32>(0.25, 0.28, 0.34);
+            tint = vec3<f32>(0.26, 0.30, 0.36);
         } else if (seg.info.x == MAT_ABSORBER) {
             tint = vec3<f32>(0.34, 0.12, 0.10);
+        } else if (seg.info.x == MAT_DIFFUSE) {
+            tint = seg.material.xyz * 0.28 + vec3<f32>(0.05);
+        } else if (seg.info.x == MAT_SPLITTER) {
+            tint = select(vec3<f32>(0.16, 0.32, 0.40), seg.material.xyz * 0.30, seg.info.y == 1u);
         }
         col = col + tint * alpha;
     }
 
+    // Circular optics, planets, and subtle atmospheric shells.
     for (var i = 0u; i < u.counts.y; i = i + 1u) {
         let cir = circles[i];
         let center = cir.geom.xy;
@@ -160,8 +205,18 @@ fn scene_overlay(world: vec2<f32>, px_world: f32) -> vec3<f32> {
         }
         let d = abs(len - radius);
         let alpha = exp(-(d * d) / (line_w * line_w));
-        let tint = select(vec3<f32>(0.08, 0.16, 0.24), vec3<f32>(0.28, 0.32, 0.38), cir.info.x == MAT_MIRROR);
-        col = col + tint * alpha;
+        if (cir.info.x == MAT_DIFFUSE) {
+            // Subtle shaded planet silhouette + rim.
+            if (len < radius) {
+                col = col + cir.material.xyz * 0.025;
+            }
+            col = col + (cir.material.xyz * 0.22 + vec3<f32>(0.04)) * alpha;
+        } else if (cir.info.x == MAT_ATMOSPHERE) {
+            col = col + vec3<f32>(0.03, 0.07, 0.14) * alpha;
+        } else {
+            let tint = select(vec3<f32>(0.08, 0.16, 0.24), vec3<f32>(0.28, 0.32, 0.38), cir.info.x == MAT_MIRROR);
+            col = col + tint * alpha;
+        }
     }
 
     return col;
@@ -186,8 +241,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let frame_xyz = vec3<f32>(rx, ry, rz);
     var acc_xyz = hdr_accum[idx].xyz;
-    if (u.counts.z != 0u) {
+    if (u.counts.z == 1u) {
         acc_xyz = frame_xyz;
+    } else if (u.counts.z == 2u) {
+        // Temporal EMA for smoothly orbiting / animated Steady scenes (zero speckle, zero lag).
+        let prev_avg = acc_xyz * u.params.w;
+        acc_xyz = mix(prev_avg, frame_xyz, 0.14);
     } else if (u.dims.w == 0u) {
         acc_xyz = acc_xyz + frame_xyz;
     } else {
@@ -195,7 +254,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     hdr_accum[idx] = vec4<f32>(acc_xyz, 1.0);
 
-    let scale = select(u.params.z, u.params.z * u.params.w, u.dims.w == 0u);
+    let eff_norm = select(u.params.w, 1.0, u.counts.z != 0u);
+    let scale = select(u.params.z, u.params.z * eff_norm, u.dims.w == 0u);
     var rgb = xyz_to_rec709(acc_xyz * scale);
 
     let half_h = u.view.z;
@@ -219,6 +279,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (phys == PHYS_GRIN_MIRAGE) {
         if (world.y < MIRAGE_Y_GROUND) {
             rgb = vec3<f32>(0.0);
+        }
+    } else {
+        // Mask solid diffuse planet interiors so grazing steps don't bleed inside solid rock.
+        for (var i = 0u; i < u.counts.y; i = i + 1u) {
+            let cir = circles[i];
+            if (cir.info.x == MAT_DIFFUSE) {
+                let v = world - cir.geom.xy;
+                if (dot(v, v) < (cir.geom.z - px_world * 0.5) * (cir.geom.z - px_world * 0.5)) {
+                    rgb = vec3<f32>(0.0);
+                }
+            }
         }
     }
     rgb = rgb + scene_overlay(world, px_world);

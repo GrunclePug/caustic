@@ -11,6 +11,8 @@ fn lavapipe_prism_and_kerr_beam_render_deterministically() {
 
     for scene_id in [
         PhotonSceneId::Prism,
+        PhotonSceneId::SolarSystem,
+        PhotonSceneId::Sandbox,
         PhotonSceneId::GrinLuneburg,
         PhotonSceneId::GrinBlackHole,
         PhotonSceneId::GrinMirage,
