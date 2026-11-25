@@ -273,8 +273,8 @@ struct PhotonArgs {
     #[arg(long, value_enum)]
     solar_focus: Option<SolarFocusArg>,
 
-    /// Solar System scale mode (`real` = exact 1:1 NASA ratios, `orrery` / `cartoon` = exaggerated overview).
-    #[arg(long, value_enum, default_value_t = SolarScaleArg::Real)]
+    /// Solar System scale mode (`orrery` / `cartoon` = exaggerated overview, `real` = exact 1:1 NASA ratios).
+    #[arg(long, value_enum, default_value_t = SolarScaleArg::Orrery)]
     solar_scale: SolarScaleArg,
 }
 
@@ -671,13 +671,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let Some(command) = cli.command else {
-        // Bare `caustic` opens the unified minimal studio on Dispersive Prism.
+        // Bare `caustic` opens the unified studio in Space -> Solar System (Orrery system view).
+        let mut photon_scene = PhotonScene::preset(PhotonSceneId::SolarSystem);
+        photon_scene.sync_solar_to_gpu(1440.0 / 860.0);
         return run_studio(StudioConfig {
-            initial_mode: StudioMode::Photons(PhotonSceneId::Prism),
+            initial_mode: StudioMode::Photons(PhotonSceneId::SolarSystem),
             camera: Camera::default(),
             bh_params: KerrParams::new(0.95, 16.0, 1000.0),
             bh_settings: RenderSettings::default(),
-            photon_scene: PhotonScene::preset(PhotonSceneId::Prism),
+            photon_scene,
             photon_settings: PhotonSettings::default(),
             width: 1440,
             height: 860,

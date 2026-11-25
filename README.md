@@ -57,22 +57,20 @@ sudo make install
 
 ### Unified Interactive Studio
 
-Launch the unified studio (all 11 named modes accessible from the top floating pill bar):
+Launch the unified studio — it opens in the **Space** tab on the exaggerated **Orrery** Solar System view, with a minimal two-tab top bar (**Space** and **Sandbox**, defaulting to **Prism**) and presets inside each tab's controls panel:
 
 ```sh
 caustic
-caustic photons view --scene solar-system --solar-focus solar-eclipse
+caustic photons view --scene solar-system --solar-scale real --solar-focus solar-eclipse
 caustic photons view --scene solar-system --solar-scale orrery
-caustic photons view --scene sandbox
+caustic photons view --scene prism
 caustic view --spin 0.95 --radius 22 --inclination 82
 ```
 
-Built-in named modes:
+Tabs & built-in presets:
 
-* **3D Relativity**: `Kerr Black Hole` (`0`)
-* **Optical Playground & Solar System**: `Dispersive Prism` (`1`), `Nephroid Cavity` (`2`), `Chromatic Lens` (`3`), `Solar System` (`4`), `Photon Sandbox` (`5`)
-* **GRIN Optics**: `Luneburg Lens` (`6`), `Optical Black Hole` (`7`), `Thermal Mirage` (`8`)
-* **2D Relativity**: `Kerr Lensing Beam` (`9`), `Kerr Pulsar`
+* **Space**: `Solar System` (`Orrery` & `Real (1:1)`, `4`), `Black Hole 3D` (`0`), `Kerr Beam` (`9`), `Kerr Pulsar`
+* **Sandbox**: `Prism` (`1`, default), `Cavity` (`2`), `Lens` (`3`), `Multi-Lab` (`5`), `Luneburg` (`6`), `Optical BH` (`7`), `Mirage` (`8`)
 
 ### Headless Rendering, Benchmarks & Verification
 
@@ -115,8 +113,8 @@ caustic verify --width 512 --height 512
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--scene` | `prism` | Preset: `prism`, `cardioid`, `lens`, `solar-system`, `sandbox`, `luneburg`, `optical-bh`, `mirage`, `kerr-beam`, `kerr-pulsar` |
-| `--solar-focus` | `lunar-eclipse` | Solar System focus or event: `lunar-eclipse`, `solar-eclipse`, `saturn`, `io-transit`, `system`, `inner`, `sun`, `mercury`, `venus`, `earth`, `moon`, `mars`, `jupiter`, `io`, `uranus`, `neptune` |
-| `--solar-scale` | `real` | Solar System linear scale: `real` (`1:1` NASA) or `orrery` / `cartoon` (exaggerated all-in-one view) |
+| `--solar-focus` | `system` | Solar System focus or event: `system`, `inner`, `lunar-eclipse`, `solar-eclipse`, `saturn`, `io-transit`, `sun`, `mercury`, `venus`, `earth`, `moon`, `mars`, `jupiter`, `io`, `uranus`, `neptune` |
+| `--solar-scale` | `orrery` | Solar System scale: `orrery` / `cartoon` (exaggerated all-in-one view) or `real` (`1:1` exact NASA ratios) |
 | `--mode` | `accumulate` | Transport mode: `accumulate` (Steady) or `pulse` (Wavefront) |
 | `--photons` | `1000000` | Photon pool size (persistent count in Wavefront; scaled per-frame batch in Steady) |
 | `--substeps` | `4` | Integration substeps per frame in Wavefront mode |

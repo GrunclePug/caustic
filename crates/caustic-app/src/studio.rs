@@ -37,11 +37,58 @@ use caustic_photons::scene::{
 use caustic_photons::solar::{
     BODY_EARTH, BODY_EUROPA, BODY_IO, BODY_JUPITER, BODY_MARS, BODY_MERCURY, BODY_MOON,
     BODY_NEPTUNE, BODY_SATURN, BODY_SUN, BODY_URANUS, BODY_VENUS, SUN_RADIUS_AU, SolarFocus,
-    SolarScale, format_distance_au, format_duration_s, format_warp,
+    SolarScale, SolarSystem, format_distance_au, format_duration_s, format_warp,
 };
 
 /// Stop stepping new photon frames in `Accumulate` mode once converged to save GPU/power.
 const MAX_CONVERGED_FRAMES: u64 = 256;
+
+/// Top-level studio tab in the minimal floating top bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StudioTab {
+    Space,
+    Sandbox,
+}
+
+impl StudioTab {
+    const ALL: [Self; 2] = [Self::Space, Self::Sandbox];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Space => "Space",
+            Self::Sandbox => "Sandbox",
+        }
+    }
+
+    fn presets(self) -> &'static [(&'static str, StudioMode)] {
+        match self {
+            Self::Space => &[
+                (
+                    "Solar System",
+                    StudioMode::Photons(PhotonSceneId::SolarSystem),
+                ),
+                ("Black Hole 3D", StudioMode::BlackHole3D),
+                ("Kerr Beam", StudioMode::Photons(PhotonSceneId::KerrBeam)),
+                (
+                    "Kerr Pulsar",
+                    StudioMode::Photons(PhotonSceneId::KerrPulsar),
+                ),
+            ],
+            Self::Sandbox => &[
+                ("Prism", StudioMode::Photons(PhotonSceneId::Prism)),
+                ("Cavity", StudioMode::Photons(PhotonSceneId::Cardioid)),
+                ("Lens", StudioMode::Photons(PhotonSceneId::Lens)),
+                ("Multi-Lab", StudioMode::Photons(PhotonSceneId::Sandbox)),
+                ("Luneburg", StudioMode::Photons(PhotonSceneId::GrinLuneburg)),
+                (
+                    "Optical BH",
+                    StudioMode::Photons(PhotonSceneId::GrinBlackHole),
+                ),
+                ("Mirage", StudioMode::Photons(PhotonSceneId::GrinMirage)),
+            ],
+        }
+    }
+}
 
 /// Active engine / named mode inside the unified studio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +98,16 @@ pub enum StudioMode {
 }
 
 impl StudioMode {
+    fn tab(self) -> StudioTab {
+        match self {
+            Self::BlackHole3D
+            | Self::Photons(
+                PhotonSceneId::SolarSystem | PhotonSceneId::KerrBeam | PhotonSceneId::KerrPulsar,
+            ) => StudioTab::Space,
+            Self::Photons(_) => StudioTab::Sandbox,
+        }
+    }
+
     pub fn display_name(self) -> &'static str {
         match self {
             Self::BlackHole3D => "Kerr Black Hole",
@@ -122,6 +179,9 @@ struct StudioGfx {
 
 struct StudioApp {
     mode: StudioMode,
+    last_space_mode: StudioMode,
+    last_sandbox_mode: StudioMode,
+    saved_solar: Option<SolarSystem>,
     // 3D Kerr black hole state
     camera: Camera,
     bh_params: KerrParams,
@@ -164,8 +224,21 @@ struct StudioApp {
 impl StudioApp {
     fn new(cfg: StudioConfig) -> Self {
         let now = Instant::now();
+        let last_space_mode = if cfg.initial_mode.tab() == StudioTab::Space {
+            cfg.initial_mode
+        } else {
+            StudioMode::Photons(PhotonSceneId::SolarSystem)
+        };
+        let last_sandbox_mode = if cfg.initial_mode.tab() == StudioTab::Sandbox {
+            cfg.initial_mode
+        } else {
+            StudioMode::Photons(PhotonSceneId::Prism)
+        };
         Self {
             mode: cfg.initial_mode,
+            last_space_mode,
+            last_sandbox_mode,
+            saved_solar: None,
             camera: cfg.camera,
             bh_params: cfg.bh_params,
             bh_settings: cfg.bh_settings,
@@ -246,8 +319,30 @@ impl StudioApp {
         }
     }
 
+    fn switch_tab(&mut self, tab: StudioTab) {
+        if self.mode.tab() == tab {
+            return;
+        }
+        if matches!(self.mode, StudioMode::Photons(PhotonSceneId::SolarSystem)) {
+            self.saved_solar = Some(self.photon_scene.solar.clone());
+        }
+        let target = match tab {
+            StudioTab::Space => self.last_space_mode,
+            StudioTab::Sandbox => self.last_sandbox_mode,
+        };
+        self.switch_mode_inner(target, true);
+    }
+
     fn switch_mode(&mut self, next: StudioMode) {
+        self.switch_mode_inner(next, false);
+    }
+
+    fn switch_mode_inner(&mut self, next: StudioMode, restore_solar: bool) {
         self.mode = next;
+        match next.tab() {
+            StudioTab::Space => self.last_space_mode = next,
+            StudioTab::Sandbox => self.last_sandbox_mode = next,
+        }
         self.drag = None;
         self.selection = Selection::Emitter(0);
         self.orbit_paused = false;
@@ -260,6 +355,9 @@ impl StudioApp {
             StudioMode::Photons(id) => {
                 self.photon_scene = PhotonScene::preset(id);
                 if id.is_solar_system() {
+                    if restore_solar && let Some(prev_solar) = self.saved_solar.take() {
+                        self.photon_scene.solar = prev_solar;
+                    }
                     let aspect = self.viewport_aspect();
                     self.photon_scene.sync_solar_to_gpu(aspect);
                 }
@@ -801,14 +899,15 @@ impl StudioApp {
             .corner_radius(CornerRadius::same(11))
             .inner_margin(Margin::symmetric(10, 6));
 
-        // 2. Top floating pill bar: brand + all named modes + live telemetry + inspector toggle.
+        // 2. Top floating pill bar: brand + Space / Sandbox tabs + live telemetry + inspector toggle.
+        let active_tab = self.mode.tab();
         egui::Area::new(Id::unique("caustic_top_bar"))
             .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 12.0))
             .fade_in(false)
             .show(&ctx, |ui| {
                 glass_frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 3.0;
+                        ui.spacing_mut().item_spacing.x = 4.0;
                         ui.label(
                             RichText::new("caustic")
                                 .strong()
@@ -817,18 +916,9 @@ impl StudioApp {
                         );
                         pill_divider(ui);
 
-                        if mode_chip(ui, "Black Hole 3D", self.mode == StudioMode::BlackHole3D) {
-                            actions.switch_mode = Some(StudioMode::BlackHole3D);
-                        }
-                        pill_divider(ui);
-
-                        for (i, id) in PhotonSceneId::ALL.iter().copied().enumerate() {
-                            if i == 5 || i == 8 {
-                                pill_divider(ui);
-                            }
-                            let active = self.mode == StudioMode::Photons(id);
-                            if mode_chip(ui, id.short_name(), active) {
-                                actions.switch_mode = Some(StudioMode::Photons(id));
+                        for tab in StudioTab::ALL {
+                            if mode_chip(ui, tab.label(), active_tab == tab) && active_tab != tab {
+                                actions.switch_tab = Some(tab);
                             }
                         }
 
@@ -900,6 +990,19 @@ impl StudioApp {
                                         },
                                     );
                                 });
+
+                                section_label(ui, "PRESETS");
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                                    ui.spacing_mut().button_padding = Vec2::new(5.5, 2.5);
+                                    for &(lbl, preset_mode) in active_tab.presets() {
+                                        if mode_chip(ui, lbl, self.mode == preset_mode)
+                                            && self.mode != preset_mode
+                                        {
+                                            actions.switch_mode = Some(preset_mode);
+                                        }
+                                    }
+                                });
                                 subtle_rule(ui);
 
                                 match self.mode {
@@ -967,7 +1070,7 @@ impl StudioApp {
                                             let is_orrery =
                                                 self.photon_scene.solar.scale.is_orrery();
                                             ui.horizontal(|ui| {
-                                                for sc in [SolarScale::Real1To1, SolarScale::Orrery]
+                                                for sc in [SolarScale::Orrery, SolarScale::Real1To1]
                                                 {
                                                     if mode_chip(
                                                         ui,
@@ -2058,6 +2161,9 @@ impl StudioApp {
             ui_actions = self.build_ui(ui, w, h, ppp, accum_frames);
         });
 
+        if let Some(next_tab) = ui_actions.switch_tab {
+            self.switch_tab(next_tab);
+        }
         if let Some(next_mode) = ui_actions.switch_mode {
             self.switch_mode(next_mode);
         }
@@ -2254,6 +2360,7 @@ impl StudioApp {
 
 #[derive(Default)]
 struct UiActions {
+    switch_tab: Option<StudioTab>,
     switch_mode: Option<StudioMode>,
     bh_trace_dirty: bool,
     bh_shade_dirty: bool,

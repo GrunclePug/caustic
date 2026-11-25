@@ -176,8 +176,26 @@ impl Default for SolarSystem {
 }
 
 impl SolarSystem {
-    /// Construct our exact-ratio Solar System starting framed on an iconic Earth + Moon Lunar Eclipse.
+    /// Construct the default exaggerated `Orrery` Solar System in full `System` overview.
     pub fn new() -> Self {
+        let bodies = Self::orrery_bodies();
+        let n = bodies.len();
+        let mut s = Self {
+            bodies,
+            scale: SolarScale::Orrery,
+            focus: SolarFocus::System,
+            sim_time_s: 0.0,
+            time_warp: 1.0,
+            view_half_height_au: 8.9,
+            pan_offset_au: [0.0, 0.0],
+            positions_au: vec![[0.0, 0.0]; n],
+        };
+        s.update_positions();
+        s
+    }
+
+    /// Construct the exact 1:1 NASA true-ratio Solar System framed on a Total Lunar Eclipse.
+    pub fn new_real() -> Self {
         let bodies = Self::real_bodies();
         let n = bodies.len();
         let mut s = Self {
@@ -1108,7 +1126,11 @@ mod tests {
 
     #[test]
     fn exact_nasa_ratios_and_kepler_third_law() {
-        let sys = SolarSystem::new();
+        let default_sys = SolarSystem::new();
+        assert_eq!(default_sys.scale, SolarScale::Orrery);
+        assert_eq!(default_sys.focus, SolarFocus::System);
+
+        let sys = SolarSystem::new_real();
 
         // Sun-to-Earth radius ratio ~ 109.3
         let sun_earth_r = sys.bodies[BODY_SUN].radius_au / sys.bodies[BODY_EARTH].radius_au;
@@ -1171,7 +1193,7 @@ mod tests {
             }
         }
 
-        let mut sys = SolarSystem::new();
+        let mut sys = SolarSystem::new_real();
         sys.stage_solar_eclipse();
         let frame = sys.compile_to_gpu(16.0 / 9.0);
         assert!(
