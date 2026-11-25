@@ -30,6 +30,7 @@ struct SimUniforms {
     emitter: [f32; 4],
     physics: [f32; 4],
     extra: [f32; 4],
+    bh: [f32; 4],
     dims: [u32; 4],
     flags: [u32; 4],
     counts: [u32; 4],
@@ -42,6 +43,7 @@ struct ResolveUniforms {
     view: [f32; 4],
     params: [f32; 4],
     kerr: [f32; 4],
+    bh: [f32; 4],
     dims: [u32; 4],
     counts: [u32; 4],
 }
@@ -530,11 +532,19 @@ impl PhotonPipeline {
             PhotonMode::Pulse => self.num_photons,
             PhotonMode::Accumulate => {
                 let phys = scene.id.physics_kind();
-                let (div, cap) = match (phys, settings.interactive_drag) {
-                    (PhysicsKind::Optics, true) => (40, 24_576),
-                    (PhysicsKind::Optics, false) => (20, 49_152),
-                    (_, true) => (64, 16_384),
-                    (_, false) => (40, 24_576),
+                let has_solar_bh = scene.id.is_solar_system()
+                    && scene
+                        .last_solar_frame
+                        .as_ref()
+                        .and_then(|sf| sf.black_hole_gpu)
+                        .is_some_and(|(_, m)| m >= 1e-4);
+                let (div, cap) = match (phys, settings.interactive_drag, has_solar_bh) {
+                    (PhysicsKind::Optics, true, true) => (64, 14_336),
+                    (PhysicsKind::Optics, false, true) => (40, 24_576),
+                    (PhysicsKind::Optics, true, false) => (40, 24_576),
+                    (PhysicsKind::Optics, false, false) => (20, 49_152),
+                    (_, true, _) => (64, 16_384),
+                    (_, false, _) => (40, 24_576),
                 };
                 (self.num_photons / div)
                     .clamp(256, cap)
@@ -651,6 +661,18 @@ impl PhotonPipeline {
             .sum::<f32>()
             .max(0.01);
 
+        let bh_uniform = if scene.id.is_solar_system() {
+            scene
+                .last_solar_frame
+                .as_ref()
+                .and_then(|sf| sf.black_hole_gpu)
+                .filter(|(_, m)| *m >= 1e-4)
+                .map(|(p, m)| [p[0] as f32, p[1] as f32, m as f32, 0.0])
+                .unwrap_or([0.0; 4])
+        } else {
+            [0.0; 4]
+        };
+
         let active_photons = self.dispatched_photons(scene, settings);
         let sim_u = SimUniforms {
             view: [
@@ -667,6 +689,7 @@ impl PhotonPipeline {
                 scene.dispersion_scale.clamp(0.0, 4.0),
                 0.0,
             ],
+            bh: bh_uniform,
             dims: [w, h, active_photons, settings.substeps.max(1)],
             flags: [
                 phys as u32,
@@ -693,28 +716,33 @@ impl PhotonPipeline {
             .as_ref()
             .is_some_and(|sf| sf.far_sun_mode);
         let solar_orrery = scene.solar.scale.is_orrery();
+        let binary_boost = if scene.id.is_solar_system() && num_emitters >= 2 {
+            1.28
+        } else {
+            1.0
+        };
         let gain_k = match (settings.mode, phys, scene.id.is_solar_system()) {
             (PhotonMode::Accumulate, PhysicsKind::Optics, true) => {
-                if solar_far {
+                (if solar_far {
                     0.26
                 } else if solar_orrery {
                     0.44
                 } else {
                     0.30
-                }
+                }) * binary_boost
             }
             (PhotonMode::Accumulate, PhysicsKind::Optics, false) => 0.16 * total_power.sqrt(),
             (PhotonMode::Accumulate, PhysicsKind::Kerr, _) => 0.14,
             (PhotonMode::Accumulate, _, _) => 0.22,
             (PhotonMode::Pulse, PhysicsKind::Kerr, _) => 0.42,
             (PhotonMode::Pulse, _, true) => {
-                if solar_far {
+                (if solar_far {
                     1.15
                 } else if solar_orrery {
                     1.25
                 } else {
                     0.95
-                }
+                }) * binary_boost
             }
             (PhotonMode::Pulse, _, false) => 0.70,
         };
@@ -741,6 +769,7 @@ impl PhotonPipeline {
                 scene.grin_strength.clamp(0.1, 3.0),
                 scene.dispersion_scale.clamp(0.0, 4.0),
             ],
+            bh: bh_uniform,
             dims: [w, h, phys as u32, settings.mode as u32],
             counts: [
                 scene.segments.len().min(MAX_SEGMENTS) as u32,

@@ -128,6 +128,120 @@ pub fn solve_kepler(mean_anomaly: f64, e: f64) -> f64 {
     ea
 }
 
+/// Spectral class for primary or companion stars (drives real Planck blackbody photon spectra).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StarClass {
+    /// Cool M-class Red Dwarf (`3,100 K`): warm ember-red light, suppressed blue Rayleigh scattering.
+    RedDwarf,
+    /// G2V yellow-white main-sequence star (`5,778 K`, our Sun).
+    Sun,
+    /// Hot B/O-class Blue Giant (`12,500 K`): intense violet/blue flux, blazing Rayleigh skies.
+    BlueGiant,
+}
+
+impl StarClass {
+    pub const ALL: [Self; 3] = [Self::RedDwarf, Self::Sun, Self::BlueGiant];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RedDwarf => "Red Dwarf",
+            Self::Sun => "Sun",
+            Self::BlueGiant => "Blue Giant",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::RedDwarf => "Red",
+            Self::Sun => "Sun",
+            Self::BlueGiant => "Blue",
+        }
+    }
+
+    pub fn temp_k(self) -> f32 {
+        match self {
+            Self::RedDwarf => 3_100.0,
+            Self::Sun => 5_778.0,
+            Self::BlueGiant => 12_500.0,
+        }
+    }
+
+    pub fn radius_mult(self) -> f64 {
+        match self {
+            Self::RedDwarf => 0.78,
+            Self::Sun => 1.0,
+            Self::BlueGiant => 1.24,
+        }
+    }
+
+    pub fn map_color(self) -> [u8; 3] {
+        match self {
+            Self::RedDwarf => [255, 118, 72],
+            Self::Sun => [255, 224, 150],
+            Self::BlueGiant => [146, 206, 255],
+        }
+    }
+
+    pub fn contrasting(self) -> Self {
+        match self {
+            Self::BlueGiant => Self::RedDwarf,
+            Self::Sun | Self::RedDwarf => Self::BlueGiant,
+        }
+    }
+}
+
+/// Optional orbiting & draggable second star for Binary Star dual-colored shadows.
+#[derive(Debug, Clone, Copy)]
+pub struct CompanionStar {
+    pub enabled: bool,
+    pub class: StarClass,
+    pub semi_major_au: f64,
+    pub period_s: f64,
+    pub phase_0: f64,
+    pub radius_au: f64,
+    pub power: f32,
+    pub pos_au: [f64; 2],
+}
+
+impl Default for CompanionStar {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            class: StarClass::BlueGiant,
+            semi_major_au: 3.35,
+            period_s: 28.0,
+            phase_0: -0.58,
+            radius_au: 0.72,
+            power: 1.0,
+            pos_au: [2.8, -1.84],
+        }
+    }
+}
+
+/// Optional draggable Schwarzschild black hole dropped into the Solar System for real-time
+/// isotropic General-Relativistic gravitational lensing of starlight and planet shadows.
+#[derive(Debug, Clone, Copy)]
+pub struct RogueBlackHole {
+    pub enabled: bool,
+    pub pos_au: [f64; 2],
+    /// Geometric mass `M` in AU (isotropic horizon `r_H = 0.5 M`, photon sphere `r_ph = 1.866 M`,
+    /// critical capture impact parameter `b_crit = 3*sqrt(3)*M = 5.196 M`).
+    pub mass_au: f64,
+    /// User-adjustable mass multiplier (`0.3..=2.5`).
+    pub mass_scale: f32,
+}
+
+impl Default for RogueBlackHole {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pos_au: [-3.4, 2.2],
+            mass_au: 0.26,
+            mass_scale: 1.0,
+        }
+    }
+}
+
 /// Compiled floating-origin GPU snapshot + HUD telemetry for the Solar System.
 #[derive(Debug, Clone)]
 pub struct SolarGpuFrame {
@@ -149,6 +263,10 @@ pub struct SolarGpuFrame {
     /// Screen-space normalized GPU positions (`x in [-aspect, aspect], y in [-1, 1]`) and GPU radii for all bodies.
     pub body_gpu_pos: Vec<[f64; 2]>,
     pub body_gpu_rad: Vec<f64>,
+    /// Optional companion star `(gpu_pos, gpu_radius, class)` when enabled.
+    pub companion_gpu: Option<([f64; 2], f64, StarClass)>,
+    /// Optional rogue black hole `(gpu_pos, gpu_mass_M)` when enabled.
+    pub black_hole_gpu: Option<([f64; 2], f64)>,
 }
 
 /// Complete double-precision Solar System state.
@@ -157,6 +275,12 @@ pub struct SolarSystem {
     pub bodies: Vec<SolarBody>,
     pub scale: SolarScale,
     pub focus: SolarFocus,
+    /// Spectral class of the central primary star (`RedDwarf`, `Sun`, `BlueGiant`).
+    pub sun_class: StarClass,
+    /// Optional second orbiting/draggable companion star for binary dual-color shadows.
+    pub companion: CompanionStar,
+    /// Optional draggable rogue black hole for live gravitational lensing inside Space.
+    pub black_hole: RogueBlackHole,
     /// Simulated elapsed time in real seconds.
     pub sim_time_s: f64,
     /// Time warp multiplier (simulated seconds per real second; e.g. `1.0` = real time, `86400.0` = 1 day/s).
@@ -184,6 +308,9 @@ impl SolarSystem {
             bodies,
             scale: SolarScale::Orrery,
             focus: SolarFocus::System,
+            sun_class: StarClass::Sun,
+            companion: CompanionStar::default(),
+            black_hole: RogueBlackHole::default(),
             sim_time_s: 0.0,
             time_warp: 1.0,
             view_half_height_au: 8.9,
@@ -202,6 +329,9 @@ impl SolarSystem {
             bodies,
             scale: SolarScale::Real1To1,
             focus: SolarFocus::Body(BODY_EARTH),
+            sun_class: StarClass::Sun,
+            companion: CompanionStar::default(),
+            black_hole: RogueBlackHole::default(),
             sim_time_s: 0.0,
             time_warp: 3_600.0,
             view_half_height_au: 0.000_25,
@@ -670,6 +800,8 @@ impl SolarSystem {
             return;
         }
         let prev_focus = self.focus;
+        let had_comp = self.companion.enabled;
+        let had_bh = self.black_hole.enabled;
         self.scale = scale;
         self.sim_time_s = 0.0;
         self.bodies = match scale {
@@ -687,6 +819,146 @@ impl SolarSystem {
                 }
             }
         }
+        if had_comp {
+            self.configure_companion_defaults();
+        }
+        if had_bh {
+            self.place_black_hole_in_view();
+        }
+    }
+
+    /// Configure scale-appropriate orbital parameters for the companion star.
+    fn configure_companion_defaults(&mut self) {
+        match self.scale {
+            SolarScale::Orrery => {
+                self.companion.semi_major_au = 3.75;
+                self.companion.period_s = 28.0;
+                self.companion.phase_0 = 1.12;
+                self.companion.radius_au = 0.76;
+            }
+            SolarScale::Real1To1 => {
+                self.companion.semi_major_au = 0.58;
+                self.companion.period_s = 0.44 * YEAR_S;
+                self.companion.phase_0 = 1.35;
+                self.companion.radius_au = SUN_RADIUS_AU * 1.05;
+            }
+        }
+        self.update_positions();
+    }
+
+    /// Place the rogue black hole cleanly inside the current camera view at an immediately dramatic scale.
+    fn place_black_hole_in_view(&mut self) {
+        let center = self.view_center_au();
+        let half_h = self.view_half_height_au.max(1e-6);
+        match self.scale {
+            SolarScale::Orrery if matches!(self.focus, SolarFocus::System | SolarFocus::Inner) => {
+                self.black_hole.pos_au = [-4.1, 1.45];
+                self.black_hole.mass_au = 0.36;
+            }
+            _ => {
+                self.black_hole.pos_au = [center[0] - half_h * 0.48, center[1] + half_h * 0.16];
+                self.black_hole.mass_au = half_h * 0.038;
+            }
+        }
+    }
+
+    /// Toggle the second orbiting star ON/OFF (choosing a contrasting spectral color by default).
+    pub fn toggle_companion(&mut self) {
+        self.companion.enabled = !self.companion.enabled;
+        if self.companion.enabled {
+            self.companion.class = self.sun_class.contrasting();
+            self.configure_companion_defaults();
+        }
+    }
+
+    /// Move the companion star interactively to `pos_au`, updating its orbit radius & phase so it
+    /// continues orbiting smoothly from the dropped location.
+    pub fn set_companion_pos_au(&mut self, pos_au: [f64; 2]) {
+        let r = pos_au[0].hypot(pos_au[1]).max(0.05);
+        let ang = pos_au[1].atan2(pos_au[0]);
+        self.companion.semi_major_au = r;
+        let omega_t = if self.companion.period_s.abs() > 1e-6 {
+            std::f64::consts::TAU * (self.sim_time_s / self.companion.period_s)
+        } else {
+            0.0
+        };
+        self.companion.phase_0 = (ang - omega_t).rem_euclid(std::f64::consts::TAU);
+        self.companion.pos_au = pos_au;
+    }
+
+    /// Toggle the drop-in Schwarzschild black hole ON/OFF right inside the current viewport.
+    pub fn toggle_black_hole(&mut self) {
+        self.black_hole.enabled = !self.black_hole.enabled;
+        if self.black_hole.enabled {
+            self.black_hole.mass_scale = 1.0;
+            self.place_black_hole_in_view();
+        }
+    }
+
+    /// Stage a dramatic **Binary Star** dual-colored shadow showcase (Red/Amber primary + Blue Giant companion).
+    pub fn stage_binary_shadows(&mut self) {
+        self.sim_time_s = 0.0;
+        self.sun_class = StarClass::RedDwarf;
+        self.companion.enabled = true;
+        self.companion.class = StarClass::BlueGiant;
+        self.black_hole.enabled = false;
+        match self.scale {
+            SolarScale::Orrery => {
+                self.set_focus(SolarFocus::System);
+                self.companion.semi_major_au = 3.75;
+                self.companion.period_s = 28.0;
+                self.companion.phase_0 = 1.12;
+                self.companion.radius_au = 0.78;
+            }
+            SolarScale::Real1To1 => {
+                self.set_focus(SolarFocus::Body(BODY_EARTH));
+                self.view_half_height_au = self.bodies[BODY_EARTH].radius_au * 4.2;
+                self.companion.semi_major_au = 0.65;
+                self.companion.period_s = 0.52 * YEAR_S;
+                self.companion.phase_0 = 1.38;
+                self.companion.radius_au = SUN_RADIUS_AU * 1.1;
+            }
+        }
+        self.update_positions();
+    }
+
+    /// Stage a dramatic **Rogue Black Hole Gravitational Lensing** showcase right in front of starlight.
+    pub fn stage_black_hole_lensing(&mut self) {
+        self.sim_time_s = 0.0;
+        self.sun_class = StarClass::Sun;
+        self.companion.enabled = false;
+        self.black_hole.enabled = true;
+        self.black_hole.mass_scale = 1.15;
+        match self.scale {
+            SolarScale::Orrery => {
+                self.set_focus(SolarFocus::System);
+                self.black_hole.pos_au = [-4.1, 1.45];
+                self.black_hole.mass_au = 0.36;
+            }
+            SolarScale::Real1To1 => {
+                self.set_focus(SolarFocus::Body(BODY_EARTH));
+                self.view_half_height_au = self.bodies[BODY_EARTH].radius_au * 5.2;
+                let e = self.body_pos_au(BODY_EARTH);
+                let h = self.view_half_height_au;
+                self.black_hole.pos_au = [e[0] - h * 0.55, e[1] + h * 0.14];
+                self.black_hole.mass_au = h * 0.036;
+            }
+        }
+        self.update_positions();
+    }
+
+    /// Sample points along the companion star's circular orbit (for HUD guide).
+    pub fn sample_companion_orbit_au(&self, num_pts: usize) -> Vec<[f64; 2]> {
+        if !self.companion.enabled || self.companion.semi_major_au <= 0.0 {
+            return Vec::new();
+        }
+        let r = self.companion.semi_major_au;
+        (0..=num_pts)
+            .map(|k| {
+                let a = std::f64::consts::TAU * (k as f64) / (num_pts as f64);
+                [r * a.cos(), r * a.sin()]
+            })
+            .collect()
     }
 
     /// Allowed camera `view_half_height_au` range for scroll zooming in the active scale mode.
@@ -715,6 +987,18 @@ impl SolarSystem {
             let ry = x_orb * sw + y_orb * cw;
             let parent_pos = b.parent.map(|p| self.positions_au[p]).unwrap_or([0.0, 0.0]);
             self.positions_au[i] = [parent_pos[0] + rx, parent_pos[1] + ry];
+        }
+        if self.companion.enabled && self.companion.semi_major_au > 0.0 {
+            let ang = self.companion.phase_0
+                + if self.companion.period_s.abs() > 1e-6 {
+                    std::f64::consts::TAU * (self.sim_time_s / self.companion.period_s)
+                } else {
+                    0.0
+                };
+            self.companion.pos_au = [
+                self.companion.semi_major_au * ang.cos(),
+                self.companion.semi_major_au * ang.sin(),
+            ];
         }
     }
 
@@ -934,12 +1218,13 @@ impl SolarSystem {
             body_gpu_rad.push(b.radius_au * inv_s);
         }
 
-        let sun_r = self.bodies[BODY_SUN].radius_au;
+        let sun_r = self.bodies[BODY_SUN].radius_au * self.sun_class.radius_mult();
         let sun_dx = center[0] - self.positions_au[BODY_SUN][0];
         let sun_dy = center[1] - self.positions_au[BODY_SUN][1];
         let sun_dist_au = (sun_dx * sun_dx + sun_dy * sun_dy).sqrt();
         let sun_dist_gpu = sun_dist_au * inv_s;
         let sun_rad_gpu = sun_r * inv_s;
+        body_gpu_rad[BODY_SUN] = sun_rad_gpu;
 
         // Exact angular radius of the Sun as seen from camera center.
         let alpha_sun = if sun_dist_au > sun_r {
@@ -1030,14 +1315,14 @@ impl SolarSystem {
             }
         }
 
-        let emitters = if far_sun_mode {
+        let mut emitters = if far_sun_mode {
             // Exact projected half-span of the rectangular viewport perpendicular to sunlight,
             // concentrating ~100% of GPU photons through the visible frame!
             let exact_span = half_w_gpu * sdir_y.abs() + sdir_x.abs();
             let span_half = exact_span * 1.06 + alpha_sun.tan() * screen_diag_gpu;
             vec![GpuEmitter {
                 geom: [0.0, 0.0, sun_to_cam_ang as f32, span_half as f32],
-                spec: [5778.0, 1.0, 1.0, alpha_sun as f32],
+                spec: [self.sun_class.temp_k(), 1.0, 1.0, alpha_sun as f32],
                 info: [
                     EMITTER_SOLAR_FAR,
                     SPEC_BLACKBODY,
@@ -1054,9 +1339,84 @@ impl SolarSystem {
                     0.0,
                     sun_rad_gpu as f32,
                 ],
-                spec: [5778.0, 1.0, 1.0, sun_spin],
+                spec: [self.sun_class.temp_k(), 1.0, 1.0, sun_spin],
                 info: [EMITTER_DISK, SPEC_BLACKBODY, 1, 0],
             }]
+        };
+
+        let companion_gpu = if self.companion.enabled {
+            let c_pos = self.companion.pos_au;
+            let c_rad_au = self.companion.radius_au * self.companion.class.radius_mult();
+            let c_gp = [
+                (c_pos[0] - center[0]) * inv_s,
+                (c_pos[1] - center[1]) * inv_s,
+            ];
+            let c_gr = c_rad_au * inv_s;
+            let c_dx = center[0] - c_pos[0];
+            let c_dy = center[1] - c_pos[1];
+            let c_dist_au = (c_dx * c_dx + c_dy * c_dy).sqrt();
+            let c_dist_gpu = c_dist_au * inv_s;
+            let c_far = c_dist_gpu > screen_diag_gpu * 3.2 + c_gr;
+            if c_far {
+                let c_ang = c_dy.atan2(c_dx);
+                let cx = c_ang.cos();
+                let cy = c_ang.sin();
+                let c_alpha = if c_dist_au > c_rad_au {
+                    (c_rad_au / c_dist_au).clamp(0.0, 1.0).asin()
+                } else {
+                    std::f64::consts::FRAC_PI_2
+                };
+                let c_span =
+                    (half_w_gpu * cy.abs() + cx.abs()) * 1.06 + c_alpha.tan() * screen_diag_gpu;
+                let c_spawn = (half_w_gpu * cx.abs() + cy.abs()) * 1.3;
+                emitters.push(GpuEmitter {
+                    geom: [0.0, 0.0, c_ang as f32, c_span as f32],
+                    spec: [
+                        self.companion.class.temp_k(),
+                        self.companion.power,
+                        1.0,
+                        c_alpha as f32,
+                    ],
+                    info: [
+                        EMITTER_SOLAR_FAR,
+                        SPEC_BLACKBODY,
+                        (c_spawn as f32).to_bits(),
+                        0,
+                    ],
+                });
+            } else {
+                let c_spin = body_spin_angle(BODY_SUN, self.sim_time_s * 1.3 + 21.0, self.scale);
+                emitters.push(GpuEmitter {
+                    geom: [c_gp[0] as f32, c_gp[1] as f32, 0.0, c_gr as f32],
+                    spec: [
+                        self.companion.class.temp_k(),
+                        self.companion.power,
+                        1.0,
+                        c_spin,
+                    ],
+                    info: [EMITTER_DISK, SPEC_BLACKBODY, 1, 0],
+                });
+            }
+            // Normalize cumulative probability weights across primary + companion stars.
+            let total_w: f32 = emitters.iter().map(|e| e.spec[1].max(0.05)).sum::<f32>();
+            let mut acc = 0.0_f32;
+            let n_em = emitters.len();
+            for (idx, em) in emitters.iter_mut().enumerate() {
+                acc += em.spec[1].max(0.05);
+                em.spec[2] = if idx + 1 == n_em { 1.0 } else { acc / total_w };
+            }
+            Some((c_gp, c_gr, self.companion.class))
+        } else {
+            None
+        };
+
+        let black_hole_gpu = if self.black_hole.enabled {
+            let bp = self.black_hole.pos_au;
+            let b_gp = [(bp[0] - center[0]) * inv_s, (bp[1] - center[1]) * inv_s];
+            let b_m_gpu = (self.black_hole.mass_au * f64::from(self.black_hole.mass_scale)) * inv_s;
+            Some((b_gp, b_m_gpu))
+        } else {
+            None
         };
 
         SolarGpuFrame {
@@ -1071,6 +1431,8 @@ impl SolarSystem {
             light_time_s: sun_dist_au * LIGHT_TIME_AU_S,
             body_gpu_pos,
             body_gpu_rad,
+            companion_gpu,
+            black_hole_gpu,
         }
     }
 }
@@ -1318,6 +1680,89 @@ mod tests {
             orr.segments.len(),
             2,
             "expected Saturn's 2 ring segments in Orrery view"
+        );
+    }
+
+    #[test]
+    fn editable_space_binary_stars_and_isotropic_schwarzschild_lensing() {
+        // 1. Verify Binary Star staging compiles 2 emitters with valid CDF & distinct star temps.
+        let mut sys = SolarSystem::new();
+        sys.stage_binary_shadows();
+        let bin = sys.compile_to_gpu(16.0 / 9.0);
+        assert_eq!(bin.emitters.len(), 2, "binary mode must emit 2 stars");
+        assert!((bin.emitters[0].spec[0] - StarClass::RedDwarf.temp_k()).abs() < 1.0);
+        assert!((bin.emitters[1].spec[0] - StarClass::BlueGiant.temp_k()).abs() < 1.0);
+        assert!(bin.emitters[0].spec[2] > 0.1 && bin.emitters[0].spec[2] < 0.9);
+        assert!((bin.emitters[1].spec[2] - 1.0).abs() < 1e-6);
+        assert!(bin.companion_gpu.is_some());
+
+        // 2. Verify Rogue Black Hole staging compiles valid GPU mass & position in both Orrery and Real.
+        sys.stage_black_hole_lensing();
+        let bh_orr = sys.compile_to_gpu(16.0 / 9.0);
+        let (_, m_orr) = bh_orr.black_hole_gpu.expect("Orrery black hole active");
+        assert!(m_orr > 0.01 && m_orr < 0.2);
+
+        sys.set_scale(SolarScale::Real1To1);
+        sys.stage_black_hole_lensing();
+        let bh_real = sys.compile_to_gpu(16.0 / 9.0);
+        let (_, m_real) = bh_real.black_hole_gpu.expect("Real 1:1 black hole active");
+        assert!(m_real > 0.01 && m_real < 0.2);
+
+        // 3. Verify our exact isotropic Schwarzschild index n(r) = (1+u)^3 / (1-u) reproduces
+        // Einstein's exact general-relativistic light deflection Delta_phi = 4M / b + b_crit = 3*sqrt(3)*M!
+        let bh_n = |r: f64, m: f64| -> f64 {
+            let u = (0.5 * m / r).min(0.92);
+            (1.0 + u).powi(3) / (1.0 - u)
+        };
+        let bh_acc = |p: [f64; 2], m: f64| -> [f64; 2] {
+            let r2 = (p[0] * p[0] + p[1] * p[1]).max((0.54 * m).powi(2));
+            let r = r2.sqrt();
+            let u = (0.5 * m / r).min(0.92);
+            let coeff = -2.0 * u * (1.0 + u).powi(5) * (2.0 - u) / ((1.0 - u).powi(3) * r2);
+            [p[0] * coeff, p[1] * coeff]
+        };
+        let trace_deflection = |b: f64| -> Option<f64> {
+            let m = 1.0_f64;
+            let mut pos = [-400.0, b];
+            let mut dir = [1.0, 0.0];
+            for _ in 0..8000 {
+                let r = pos[0].hypot(pos[1]);
+                if r <= 0.62 * m {
+                    return None;
+                }
+                let n0 = bh_n(r, m);
+                let p0 = [dir[0] * n0, dir[1] * n0];
+                let h = (0.025 * r / n0).clamp(0.004, 1.5);
+                let k1x = p0;
+                let k1p = bh_acc(pos, m);
+                let k2x = [p0[0] + 0.5 * h * k1p[0], p0[1] + 0.5 * h * k1p[1]];
+                let k2p = bh_acc([pos[0] + 0.5 * h * k1x[0], pos[1] + 0.5 * h * k1x[1]], m);
+                let k3x = [p0[0] + 0.5 * h * k2p[0], p0[1] + 0.5 * h * k2p[1]];
+                let k3p = bh_acc([pos[0] + 0.5 * h * k2x[0], pos[1] + 0.5 * h * k2x[1]], m);
+                let k4x = [p0[0] + h * k3p[0], p0[1] + h * k3p[1]];
+                let k4p = bh_acc([pos[0] + h * k3x[0], pos[1] + h * k3x[1]], m);
+                pos[0] += (h / 6.0) * (k1x[0] + 2.0 * k2x[0] + 2.0 * k3x[0] + k4x[0]);
+                pos[1] += (h / 6.0) * (k1x[1] + 2.0 * k2x[1] + 2.0 * k3x[1] + k4x[1]);
+                let np = [
+                    p0[0] + (h / 6.0) * (k1p[0] + 2.0 * k2p[0] + 2.0 * k3p[0] + k4p[0]),
+                    p0[1] + (h / 6.0) * (k1p[1] + 2.0 * k2p[1] + 2.0 * k3p[1] + k4p[1]),
+                ];
+                let nl = np[0].hypot(np[1]);
+                dir = [np[0] / nl, np[1] / nl];
+                if pos[0] > 400.0 {
+                    return Some((-dir[1]).atan2(dir[0]));
+                }
+            }
+            None
+        };
+        // Exact capture threshold b_crit = 3*sqrt(3) = 5.196 M
+        assert!(trace_deflection(4.8).is_none(), "b=4.8M must be captured");
+        let d40 = trace_deflection(40.0).expect("b=40M must escape");
+        let einstein_40 = 4.0 / 40.0 + 15.0 * std::f64::consts::PI / (4.0 * 40.0 * 40.0);
+        let rel_err = (d40 - einstein_40).abs() / einstein_40;
+        assert!(
+            rel_err < 0.015,
+            "isotropic Schwarzschild deflection at b=40M: got {d40:.6}, expected {einstein_40:.6} (rel_err={rel_err:.4})"
         );
     }
 }

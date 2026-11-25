@@ -4,6 +4,10 @@ GPU-accelerated photon playground and general-relativistic physics studio in pur
 
 ![Exaggerated Orrery Solar System with 5778K Sun, all 8 planets, moons, Rayleigh skies, and Saturn rings](docs/solar-system.png)
 
+![Binary star system with Red Dwarf and Blue Giant casting real dual-colored overlapping shadows behind Earth](docs/binary-stars.png)
+
+![Rogue Schwarzschild black hole dropped in front of Earth bending sunlight into crossed lensed shadows](docs/blackhole-lensing.png)
+
 ![True-ratio 1:1 Solar Eclipse with Moon at exact 363,300 km perigee casting a tapering umbra onto Earth](docs/solar-eclipse.png)
 
 ![Saturn at exact 1:1 scale with 1.28-2.35 R icy rings casting translucent shadows in 5778K sunlight](docs/saturn-rings.png)
@@ -27,7 +31,8 @@ GPU-accelerated photon playground and general-relativistic physics studio in pur
 
 * **Real (1:1) & Orrery Solar System modes**: Switch live between exact `1:1` NASA radii, J2000 mean semi-major axes, eccentricities, Kepler's Third Law periods, and Bond albedos for the Sun, all 8 planets, Moon, Io, Europa, and Saturn's rings (`1.28-2.35 R`), or an exaggerated `Orrery` view where the Sun, every planet, moon, Rayleigh atmosphere, and ring shadow fit together on one screen — all rendered with real 2K spacecraft textures, mipmapped 3D sphere lighting, live axial rotation, Cassini ring banding, and eclipse umbra/penumbra shading.
 * **Floating-origin camera & frustum-sampled sunlight**: Computes camera-relative `f64` coordinates before GPU upload and switches automatically to frustum importance-sampled finite-angular-disk `5778 K` sunlight (`0.533 deg` at Earth, `0.056 deg` at Saturn, `0.018 deg` at Neptune), enabling seamless zoom across more than six orders of magnitude (`90 AU` down to `7,500 km`) with true total/annular solar eclipses, Rayleigh-refracted lunar eclipses, Saturn ring shadows, and Io transits.
-* **KSP/KSA map view & staged astronomical events**: Draws live Keplerian orbit ellipses, clickable body reticles, logarithmic time warp (`1x` to `30d/s`), live telemetry (view height, Sun distance, solar angular diameter, and light-travel delay), and one-click presets for `Lunar Eclipse`, `Solar Eclipse`, `Saturn Rings`, and `Io Transit`.
+* **Editable Space (Star Classes, Binary Stars & Rogue Black Hole)**: Swap the Sun's Planck spectrum live between **Red Dwarf (`3,100 K`)**, **Sun (`5,778 K`)**, and **Blue Giant (`12,500 K`)**; spawn a draggable orbiting **Binary Companion Star** that casts real dual-colored overlapping shadows across every planet; or drop a draggable **Schwarzschild Black Hole** into the Solar System to bend sunlight and planet shadows via exact isotropic General Relativity (`n(r) = (1+u)^3/(1-u)` with Shapiro delay in Wavefront mode).
+* **KSP/KSA map view & staged astronomical events**: Draws live Keplerian orbit ellipses, clickable body reticles, logarithmic time warp (`1x` to `30d/s`), live telemetry (view height, Sun distance, solar angular diameter, and light-travel delay), and one-click presets for `Lunar Eclipse`, `Solar Eclipse`, `Saturn Rings`, `Io Transit`, `Binary Shadows`, and `BH Lensing`.
 * **Multi-emitter physical light sources**: Combine up to 16 simultaneous emitters (`Beam`, `Point`, `Spotlight`, `Star Disk`) with equal-energy white, true Planck blackbody temperatures (`2000-15000 K`), or monochromatic lasers (`400-700 nm`).
 * **Interactive photon sandbox & real glass catalog**: Click to move, `Shift+drag` to rotate, add (`Prism`, `Lens`, `Mirror`, `Arc`, `Beam Splitter`, `Matte Wall`, `Planet`, `Stop`), or delete elements live using published refractive dispersion (`Water`, `BK7 Glass`, `SF11 Flint`, `Diamond`, plus studio `High-Disp`), exact unpolarized Fresnel reflection/refraction, TIR, and Lambertian albedo scattering.
 * **Continuous GRIN eikonal optics**: Integrates Fermat's eikonal Hamiltonian `H = 1/2 (|p|^2 - n(x, lambda)^2) = 0` via RK4 across an aberration-free **Luneburg Lens**, a chromatic inverse-square **Optical Black Hole**, and a **Thermal Mirage** caustic.

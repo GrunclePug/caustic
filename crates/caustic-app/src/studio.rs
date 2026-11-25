@@ -37,7 +37,7 @@ use caustic_photons::scene::{
 use caustic_photons::solar::{
     BODY_EARTH, BODY_EUROPA, BODY_IO, BODY_JUPITER, BODY_MARS, BODY_MERCURY, BODY_MOON,
     BODY_NEPTUNE, BODY_SATURN, BODY_SUN, BODY_URANUS, BODY_VENUS, SUN_RADIUS_AU, SolarFocus,
-    SolarScale, SolarSystem, format_distance_au, format_duration_s, format_warp,
+    SolarScale, SolarSystem, StarClass, format_distance_au, format_duration_s, format_warp,
 };
 
 /// Stop stepping new photon frames in `Accumulate` mode once converged to save GPU/power.
@@ -159,6 +159,8 @@ enum Selection {
 enum CanvasDrag {
     Orbit3D,
     SolarPan,
+    SolarCompanion,
+    SolarBlackHole,
     EmitterMove { idx: usize },
     EmitterAim { idx: usize },
     ElementMove { idx: usize, offset: [f32; 2] },
@@ -301,6 +303,8 @@ impl StudioApp {
         let static_gpu_map = !clear_accum
             && self.photon_scene.circles.is_empty()
             && self.photon_scene.segments.is_empty()
+            && !self.photon_scene.solar.companion.enabled
+            && !self.photon_scene.solar.black_hole.enabled
             && self
                 .photon_scene
                 .last_solar_frame
@@ -789,23 +793,123 @@ impl StudioApp {
                         }
 
                         let lbl_pos = pos + Vec2::new(0.0, r_px.max(7.0) + 5.0);
+                        let body_label = if i == BODY_SUN {
+                            solar.sun_class.label()
+                        } else {
+                            b.name
+                        };
                         painter.text(
                             lbl_pos + Vec2::new(1.0, 1.0),
                             Align2::CENTER_TOP,
-                            b.name,
+                            body_label,
                             FontId::proportional(10.0),
                             Color32::from_rgba_unmultiplied(0, 0, 0, 220),
                         );
                         painter.text(
                             lbl_pos,
                             Align2::CENTER_TOP,
-                            b.name,
+                            body_label,
                             FontId::proportional(10.0),
                             if is_focused {
                                 Color32::from_rgb(245, 249, 255)
                             } else {
                                 Color32::from_rgba_unmultiplied(222, 232, 246, 205)
                             },
+                        );
+                    }
+
+                    // Optional Companion Star orbit guide, draggable reticle & label.
+                    if let Some((cgp, cgr, cclass)) = sf.companion_gpu {
+                        let mc = cclass.map_color();
+                        let comp_pts = solar.sample_companion_orbit_au(96);
+                        if !comp_pts.is_empty() {
+                            let c_col = Color32::from_rgba_unmultiplied(mc[0], mc[1], mc[2], 90);
+                            let spts: Vec<Pos2> = comp_pts
+                                .into_iter()
+                                .map(|p| {
+                                    Self::world_to_egui(
+                                        [
+                                            ((p[0] - c_au[0]) * inv_s) as f32,
+                                            ((p[1] - c_au[1]) * inv_s) as f32,
+                                        ],
+                                        &self.photon_scene,
+                                        width_px,
+                                        height_px,
+                                        ppp,
+                                    )
+                                })
+                                .collect();
+                            for seg in spts.windows(2) {
+                                painter.line_segment([seg[0], seg[1]], Stroke::new(1.1, c_col));
+                            }
+                        }
+                        if cgp[0].abs() <= aspect * 1.15 && cgp[1].abs() <= 1.15 {
+                            let pos = Self::world_to_egui(
+                                [cgp[0] as f32, cgp[1] as f32],
+                                &self.photon_scene,
+                                width_px,
+                                height_px,
+                                ppp,
+                            );
+                            let r_px = (cgr as f32) * px_per_gpu;
+                            painter.circle_stroke(
+                                pos,
+                                r_px.max(7.0) + 4.0,
+                                Stroke::new(
+                                    1.2,
+                                    Color32::from_rgba_unmultiplied(mc[0], mc[1], mc[2], 165),
+                                ),
+                            );
+                            let lbl_pos = pos + Vec2::new(0.0, r_px.max(7.0) + 7.0);
+                            painter.text(
+                                lbl_pos + Vec2::new(1.0, 1.0),
+                                Align2::CENTER_TOP,
+                                cclass.label(),
+                                FontId::proportional(10.0),
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+                            );
+                            painter.text(
+                                lbl_pos,
+                                Align2::CENTER_TOP,
+                                cclass.label(),
+                                FontId::proportional(10.0),
+                                Color32::from_rgb(mc[0], mc[1], mc[2]),
+                            );
+                        }
+                    }
+
+                    // Optional Rogue Black Hole draggable reticle & label.
+                    if let Some((bgp, bm)) = sf.black_hole_gpu
+                        && bgp[0].abs() <= aspect * 1.15
+                        && bgp[1].abs() <= 1.15
+                    {
+                        let pos = Self::world_to_egui(
+                            [bgp[0] as f32, bgp[1] as f32],
+                            &self.photon_scene,
+                            width_px,
+                            height_px,
+                            ppp,
+                        );
+                        let ph_px = ((1.866_025_4 * bm) as f32) * px_per_gpu;
+                        painter.circle_stroke(
+                            pos,
+                            ph_px.max(10.0) + 4.0,
+                            Stroke::new(1.2, Color32::from_rgba_unmultiplied(150, 190, 255, 140)),
+                        );
+                        let lbl_pos = pos + Vec2::new(0.0, ph_px.max(10.0) + 7.0);
+                        painter.text(
+                            lbl_pos + Vec2::new(1.0, 1.0),
+                            Align2::CENTER_TOP,
+                            "Black Hole",
+                            FontId::proportional(10.0),
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+                        );
+                        painter.text(
+                            lbl_pos,
+                            Align2::CENTER_TOP,
+                            "Black Hole",
+                            FontId::proportional(10.0),
+                            Color32::from_rgb(174, 210, 255),
                         );
                     }
                 }
@@ -1084,6 +1188,118 @@ impl StudioApp {
                                                 }
                                             });
 
+                                            section_label(ui, "STARS & GRAVITY");
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                                                ui.spacing_mut().button_padding =
+                                                    Vec2::new(5.5, 2.5);
+                                                for sc in StarClass::ALL {
+                                                    if mode_chip(
+                                                        ui,
+                                                        sc.label(),
+                                                        self.photon_scene.solar.sun_class == sc,
+                                                    ) && self.photon_scene.solar.sun_class != sc
+                                                    {
+                                                        self.photon_scene.solar.sun_class = sc;
+                                                        actions.solar_changed = true;
+                                                    }
+                                                }
+                                            });
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 3.0);
+                                                ui.spacing_mut().button_padding =
+                                                    Vec2::new(6.0, 2.5);
+                                                let has_comp =
+                                                    self.photon_scene.solar.companion.enabled;
+                                                if mode_chip(
+                                                    ui,
+                                                    if has_comp {
+                                                        "Binary Star"
+                                                    } else {
+                                                        "+ Binary Star"
+                                                    },
+                                                    has_comp,
+                                                ) {
+                                                    self.photon_scene.solar.toggle_companion();
+                                                    actions.solar_changed = true;
+                                                }
+                                                let has_bh =
+                                                    self.photon_scene.solar.black_hole.enabled;
+                                                if mode_chip(
+                                                    ui,
+                                                    if has_bh {
+                                                        "Black Hole"
+                                                    } else {
+                                                        "+ Black Hole"
+                                                    },
+                                                    has_bh,
+                                                ) {
+                                                    self.photon_scene.solar.toggle_black_hole();
+                                                    actions.solar_changed = true;
+                                                }
+                                            });
+                                            if self.photon_scene.solar.companion.enabled {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        RichText::new("Companion")
+                                                            .size(10.5)
+                                                            .color(Color32::from_rgb(
+                                                                154, 166, 186,
+                                                            )),
+                                                    );
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            ui.spacing_mut().item_spacing.x = 3.0;
+                                                            ui.spacing_mut().button_padding =
+                                                                Vec2::new(5.5, 2.0);
+                                                            for sc in
+                                                                StarClass::ALL.into_iter().rev()
+                                                            {
+                                                                if mode_chip(
+                                                                    ui,
+                                                                    sc.short_label(),
+                                                                    self.photon_scene
+                                                                        .solar
+                                                                        .companion
+                                                                        .class
+                                                                        == sc,
+                                                                ) && self
+                                                                    .photon_scene
+                                                                    .solar
+                                                                    .companion
+                                                                    .class
+                                                                    != sc
+                                                                {
+                                                                    self.photon_scene
+                                                                        .solar
+                                                                        .companion
+                                                                        .class = sc;
+                                                                    actions.solar_changed = true;
+                                                                }
+                                                            }
+                                                        },
+                                                    );
+                                                });
+                                            }
+                                            if self.photon_scene.solar.black_hole.enabled
+                                                && labeled_slider(
+                                                    ui,
+                                                    "BH Mass",
+                                                    &mut self
+                                                        .photon_scene
+                                                        .solar
+                                                        .black_hole
+                                                        .mass_scale,
+                                                    0.3..=2.5,
+                                                    false,
+                                                )
+                                            {
+                                                actions.solar_changed = true;
+                                            }
+
                                             section_label(ui, "EVENTS");
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
@@ -1103,6 +1319,16 @@ impl StudioApp {
                                                     self.photon_scene
                                                         .solar
                                                         .stage_jupiter_io_transit();
+                                                    actions.solar_changed = true;
+                                                }
+                                                if ui.small_button("Binary Shadows").clicked() {
+                                                    self.photon_scene.solar.stage_binary_shadows();
+                                                    actions.solar_changed = true;
+                                                }
+                                                if ui.small_button("BH Lensing").clicked() {
+                                                    self.photon_scene
+                                                        .solar
+                                                        .stage_black_hole_lensing();
                                                     actions.solar_changed = true;
                                                 }
                                             });
@@ -2069,7 +2295,7 @@ impl StudioApp {
         let hint_text = match self.mode {
             StudioMode::BlackHole3D => "LMB Orbit · Scroll Zoom · H Hide UI",
             StudioMode::Photons(PhotonSceneId::SolarSystem) => {
-                "Click Body Focus · LMB Pan · Scroll Zoom · P Pause · M Wavefront · H Hide UI"
+                "Click Body Focus · Drag Star/BH or Pan · Scroll Zoom · P Pause · M Wavefront · H Hide UI"
             }
             StudioMode::Photons(id) if id.is_optics() => {
                 "LMB Drag Emitter / Object · Shift+LMB Rotate · RMB Aim · Scroll Zoom · H Hide UI"
@@ -2521,7 +2747,8 @@ impl ApplicationHandler for StudioApp {
                         self.drag = Some(CanvasDrag::Orbit3D);
                     }
                     (StudioMode::Photons(PhotonSceneId::SolarSystem), MouseButton::Left) => {
-                        // Click a planet/moon reticle to focus onto it, or drag anywhere to pan in f64 AU.
+                        // Drag Rogue Black Hole or Companion Star, click a planet/moon to focus, or drag to pan.
+                        let mut grabbed_special: Option<CanvasDrag> = None;
                         let mut clicked_body: Option<usize> = None;
                         if let Some((cx, cy)) = self.last_cursor
                             && let Some(gfx) = &self.gfx
@@ -2531,25 +2758,51 @@ impl ApplicationHandler for StudioApp {
                             let h = f64::from(gfx.surface_config.height.max(1));
                             let aspect = w / h;
                             let inv_s = 1.0 / sf.view_half_height_au.max(1e-9);
-                            let mut best_d = 18.0_f64;
-                            for (i, b) in self.photon_scene.solar.bodies.iter().enumerate() {
-                                if b.parent.is_some()
-                                    && (b.semi_major_au * inv_s) * (h * 0.5) < 14.0
-                                {
-                                    continue;
-                                }
-                                let gp = sf.body_gpu_pos[i];
-                                let bx = (gp[0] / aspect * 0.5 + 0.5) * w;
-                                let by = (0.5 - gp[1] * 0.5) * h;
+
+                            if let Some((bgp, bm)) = sf.black_hole_gpu {
+                                let bx = (bgp[0] / aspect * 0.5 + 0.5) * w;
+                                let by = (0.5 - bgp[1] * 0.5) * h;
                                 let d = ((cx - bx).powi(2) + (cy - by).powi(2)).sqrt();
-                                let pick = (sf.body_gpu_rad[i] * h * 0.5).max(16.0);
-                                if d <= pick && d < best_d.max(pick) {
-                                    best_d = d;
-                                    clicked_body = Some(i);
+                                let pick = (1.866_025_4 * bm * h * 0.5 * 1.25).max(24.0);
+                                if d <= pick {
+                                    grabbed_special = Some(CanvasDrag::SolarBlackHole);
+                                }
+                            }
+                            if grabbed_special.is_none()
+                                && let Some((cgp, cgr, _)) = sf.companion_gpu
+                            {
+                                let bx = (cgp[0] / aspect * 0.5 + 0.5) * w;
+                                let by = (0.5 - cgp[1] * 0.5) * h;
+                                let d = ((cx - bx).powi(2) + (cy - by).powi(2)).sqrt();
+                                let pick = (cgr * h * 0.5 * 1.15).max(22.0);
+                                if d <= pick {
+                                    grabbed_special = Some(CanvasDrag::SolarCompanion);
+                                }
+                            }
+
+                            if grabbed_special.is_none() {
+                                let mut best_d = 18.0_f64;
+                                for (i, b) in self.photon_scene.solar.bodies.iter().enumerate() {
+                                    if b.parent.is_some()
+                                        && (b.semi_major_au * inv_s) * (h * 0.5) < 14.0
+                                    {
+                                        continue;
+                                    }
+                                    let gp = sf.body_gpu_pos[i];
+                                    let bx = (gp[0] / aspect * 0.5 + 0.5) * w;
+                                    let by = (0.5 - gp[1] * 0.5) * h;
+                                    let d = ((cx - bx).powi(2) + (cy - by).powi(2)).sqrt();
+                                    let pick = (sf.body_gpu_rad[i] * h * 0.5).max(16.0);
+                                    if d <= pick && d < best_d.max(pick) {
+                                        best_d = d;
+                                        clicked_body = Some(i);
+                                    }
                                 }
                             }
                         }
-                        if let Some(idx) = clicked_body {
+                        if let Some(special) = grabbed_special {
+                            self.drag = Some(special);
+                        } else if let Some(idx) = clicked_body {
                             self.photon_scene.solar.set_focus(SolarFocus::Body(idx));
                             self.sync_solar_scene(true, false);
                             self.photon_last_edit = Instant::now();
@@ -2648,6 +2901,36 @@ impl ApplicationHandler for StudioApp {
                                 (position.x - px) * au_per_px;
                             self.photon_scene.solar.pan_offset_au[1] +=
                                 (position.y - py) * au_per_px;
+                            self.sync_solar_scene(true, false);
+                            self.photon_last_edit = Instant::now();
+                        }
+                    }
+                    CanvasDrag::SolarCompanion => {
+                        if let Some(gfx) = &self.gfx {
+                            let w = f64::from(gfx.surface_config.width.max(1));
+                            let h = f64::from(gfx.surface_config.height.max(1));
+                            let aspect = w / h;
+                            let half_h = self.photon_scene.solar.view_half_height_au;
+                            let c = self.photon_scene.solar.view_center_au();
+                            let nx = (position.x / w) * 2.0 - 1.0;
+                            let ny = 1.0 - (position.y / h) * 2.0;
+                            let pos_au = [c[0] + nx * half_h * aspect, c[1] + ny * half_h];
+                            self.photon_scene.solar.set_companion_pos_au(pos_au);
+                            self.sync_solar_scene(true, false);
+                            self.photon_last_edit = Instant::now();
+                        }
+                    }
+                    CanvasDrag::SolarBlackHole => {
+                        if let Some(gfx) = &self.gfx {
+                            let w = f64::from(gfx.surface_config.width.max(1));
+                            let h = f64::from(gfx.surface_config.height.max(1));
+                            let aspect = w / h;
+                            let half_h = self.photon_scene.solar.view_half_height_au;
+                            let c = self.photon_scene.solar.view_center_au();
+                            let nx = (position.x / w) * 2.0 - 1.0;
+                            let ny = 1.0 - (position.y / h) * 2.0;
+                            self.photon_scene.solar.black_hole.pos_au =
+                                [c[0] + nx * half_h * aspect, c[1] + ny * half_h];
                             self.sync_solar_scene(true, false);
                             self.photon_last_edit = Instant::now();
                         }

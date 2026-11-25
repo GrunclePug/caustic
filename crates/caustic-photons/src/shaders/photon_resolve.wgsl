@@ -10,6 +10,8 @@ struct ResolveUniforms {
     params: vec4<f32>,
     // x = spin a, y = r_plus, z = grin_strength, w = dispersion_scale
     kerr: vec4<f32>,
+    // Optional rogue Schwarzschild black hole: xy = pos, z = geometric mass M (<=0 disables), w = reserved
+    bh: vec4<f32>,
     // x = width, y = height, z = physics_kind, w = mode (0=Accumulate, 1=Pulse)
     dims: vec4<u32>,
     // x = num_segments, y = num_circles, z = clear_hdr (0/1/2), w = num_emitters
@@ -94,19 +96,35 @@ fn dist_to_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 }
 
 fn star_color_tint(temp_k: f32) -> vec3<f32> {
-    let t = clamp((temp_k - 2500.0) / 9500.0, 0.0, 1.0);
-    let warm = vec3<f32>(1.0, 0.45, 0.15);
-    let sun = vec3<f32>(1.0, 0.94, 0.80);
-    let hot = vec3<f32>(0.70, 0.86, 1.0);
-    return select(mix(sun, hot, (t - 0.35) / 0.65), mix(warm, sun, t / 0.35), t < 0.35);
+    let t = clamp((temp_k - 2800.0) / 9700.0, 0.0, 1.0);
+    let red = vec3<f32>(1.0, 0.34, 0.10);
+    let sun = vec3<f32>(1.0, 0.94, 0.82);
+    let blue = vec3<f32>(0.42, 0.72, 1.0);
+    return select(mix(sun, blue, (t - 0.31) / 0.69), mix(red, sun, t / 0.31), t < 0.31);
 }
 
-// Returns xy = unit vector from `pt` toward primary Sun/light source, z = solar angular radius (rad), w = distance.
-fn primary_light_info(pt: vec2<f32>) -> vec4<f32> {
-    if (u.counts.w == 0u) {
-        return vec4<f32>(-1.0, 0.0, 0.005, 1e5);
+// Map 2K solar granulation texture cleanly across spectral star classes (Red Dwarf -> Sun -> Blue Giant).
+fn star_photosphere_color(sun_tex: vec3<f32>, temp_k: f32, lz: f32) -> vec3<f32> {
+    let limb = 0.42 + 0.58 * pow(lz, 0.55);
+    let gran = clamp(dot(sun_tex, vec3<f32>(0.30, 0.58, 0.12)), 0.0, 1.0);
+    if (temp_k < 4600.0) {
+        let f = clamp((4600.0 - temp_k) / 1600.0, 0.0, 1.0);
+        let red_plasma = mix(vec3<f32>(0.42, 0.03, 0.005), vec3<f32>(1.0, 0.42, 0.09), pow(gran, 0.72));
+        let base = mix(sun_tex, red_plasma, f);
+        return base * (1.10 + 1.35 * limb) + vec3<f32>(0.22, 0.05, 0.01) * (lz * lz);
     }
-    let em = emitters[0];
+    if (temp_k > 7500.0) {
+        let f = clamp((temp_k - 7500.0) / 4500.0, 0.0, 1.0);
+        let blue_plasma = mix(vec3<f32>(0.08, 0.24, 0.78), vec3<f32>(0.80, 0.94, 1.0), pow(gran, 0.68));
+        let base = mix(sun_tex, blue_plasma, f);
+        return base * (1.20 + 1.50 * limb) + vec3<f32>(0.10, 0.18, 0.32) * (lz * lz);
+    }
+    return sun_tex * (1.25 + 1.45 * limb) + vec3<f32>(0.22, 0.11, 0.025) * (lz * lz);
+}
+
+// Returns xy = unit vector from `pt` toward emitter `em_idx`, z = angular radius (rad), w = distance.
+fn emitter_light_info(em_idx: u32, pt: vec2<f32>) -> vec4<f32> {
+    let em = emitters[em_idx];
     if (em.info.x == EMITTER_SOLAR_FAR) {
         let sdir = vec2<f32>(cos(em.geom.z), sin(em.geom.z));
         return vec4<f32>(-sdir, max(em.spec.w, 1e-4), 1e6);
@@ -258,7 +276,7 @@ fn scene_overlay(world: vec2<f32>, px_world: f32, base_rgb: vec3<f32>) -> vec3<f
         let d = length(world - (a + ab * t_seg));
 
         if (seg.info.x == MAT_SPLITTER && seg.info.y == 1u) {
-            // Real Cassini radial ring banding (C, B, Cassini Division, A rings) with Saturn shadow.
+            // Real Cassini radial ring banding (C, B, Cassini Division, A rings) illuminated by all stars.
             let ring_w = max(px_world * 2.2, sqrt(ab_len2) * 0.052);
             if (d < ring_w * 3.0) {
                 let ring_s = textureSampleLevel(
@@ -267,10 +285,18 @@ fn scene_overlay(world: vec2<f32>, px_world: f32, base_rgb: vec3<f32>) -> vec3<f
                     vec2<f32>(clamp(t_seg, 0.002, 0.998), 0.5),
                     0.0,
                 );
-                let sinfo = primary_light_info(world);
-                let ecl = eclipse_illumination(world, 0.0, 9999u, sinfo.xy, sinfo.z, sinfo.w);
+                let n_em = min(u.counts.w, 4u);
+                var light_sum = vec3<f32>(0.0);
+                let em_scale = 1.0 / max(f32(n_em), 1.0);
+                for (var e = 0u; e < n_em; e = e + 1u) {
+                    let em = emitters[e];
+                    let sinfo = emitter_light_info(e, world);
+                    let ecl = eclipse_illumination(world, 0.0, 9999u, sinfo.xy, sinfo.z, sinfo.w);
+                    let st = select(vec3<f32>(1.0), star_color_tint(em.spec.x), em.info.y == SPEC_BLACKBODY);
+                    light_sum = light_sum + st * ecl * em_scale;
+                }
                 let prof = exp(-(d * d) / (ring_w * ring_w));
-                let ring_lit = ring_s.rgb * (1.35 * ecl + vec3<f32>(0.05));
+                let ring_lit = ring_s.rgb * (1.35 * light_sum + vec3<f32>(0.05));
                 col = col + ring_lit * (ring_s.a * prof);
             }
             continue;
@@ -306,9 +332,7 @@ fn scene_overlay(world: vec2<f32>, px_world: f32, base_rgb: vec3<f32>) -> vec3<f
                 let lz = sqrt(max(1.0 - min(dot(lp, lp), 1.0), 0.0));
                 if (em.info.z == 1u && rad_px > 5.0) {
                     let sun_tex = sample_sphere_tex(lp, lz, em.spec.w, 0.18, 0, rad_px);
-                    let limb = 0.42 + 0.58 * pow(lz, 0.55);
-                    // Preserve fiery SDO granulation & active regions through AgX without flattening to solid white.
-                    let photosphere = sun_tex * (1.25 + 1.45 * limb) + vec3<f32>(0.22, 0.11, 0.025) * (lz * lz);
+                    let photosphere = star_photosphere_color(sun_tex, em.spec.x, lz);
                     col = mix(col, photosphere, cov);
                 } else {
                     let limb = 0.45 + 0.55 * lz;
@@ -318,7 +342,7 @@ fn scene_overlay(world: vec2<f32>, px_world: f32, base_rgb: vec3<f32>) -> vec3<f
             if (r > vis_rad - px_world) {
                 let d = max(r - vis_rad, 0.0);
                 let halo_w = max(true_rad * 0.30, px_world * 10.0);
-                let corona_tint = select(tint, vec3<f32>(1.0, 0.78, 0.42), em.info.z == 1u && rad_px > 5.0);
+                let corona_tint = select(tint, mix(tint, vec3<f32>(1.0, 0.80, 0.48), 0.25), em.info.z == 1u && rad_px > 5.0);
                 col = col + corona_tint * (0.42 * exp(-d / halo_w));
             }
         }
@@ -357,19 +381,34 @@ fn scene_overlay(world: vec2<f32>, px_world: f32, base_rgb: vec3<f32>) -> vec3<f
                     let layer = i32(cir.info.y - 1u);
                     let tex_rgb = sample_sphere_tex(lp, lz, cir.material.w, 0.28, layer, rad_px);
 
-                    let sinfo = primary_light_info(center);
-                    let sun_3d = normalize(vec3<f32>(sinfo.x, sinfo.y, 0.22));
-                    let ndotl = max(dot(vec3<f32>(lp.x, lp.y, lz), sun_3d), 0.0);
-                    let lit = pow(ndotl, 0.85);
-                    let ecl = eclipse_illumination(world, radius * lz, i, sinfo.xy, sinfo.z, sinfo.w);
-
-                    var planet_col = tex_rgb * (1.28 * lit * ecl + vec3<f32>(0.032));
+                    let n_em = min(u.counts.w, 4u);
                     let has_atmo = (i + 1u < u.counts.y) && (circles[i + 1u].info.x == MAT_ATMOSPHERE);
-                    if (has_atmo) {
-                        let fres = pow(1.0 - lz, 2.8) * smoothstep(0.0, 0.40, ndotl + 0.14);
-                        let rim_tint = mix(cir.material.xyz, vec3<f32>(0.26, 0.58, 1.0), 0.45);
-                        planet_col = planet_col + rim_tint * (0.42 * fres) * ecl;
+                    let rim_base = mix(cir.material.xyz, vec3<f32>(0.26, 0.58, 1.0), 0.45);
+                    let em_norm = select(1.0, 0.85, n_em >= 2u);
+                    var direct_light = vec3<f32>(0.0);
+                    var atmo_light = vec3<f32>(0.0);
+                    if (n_em == 0u) {
+                        let sun_3d = normalize(vec3<f32>(-1.0, 0.0, 0.22));
+                        let ndotl = max(dot(vec3<f32>(lp.x, lp.y, lz), sun_3d), 0.0);
+                        direct_light = vec3<f32>(pow(ndotl, 0.85));
+                    } else {
+                        for (var e = 0u; e < n_em; e = e + 1u) {
+                            let em = emitters[e];
+                            let sinfo = emitter_light_info(e, center);
+                            let sun_3d = normalize(vec3<f32>(sinfo.x, sinfo.y, 0.22));
+                            let ndotl = max(dot(vec3<f32>(lp.x, lp.y, lz), sun_3d), 0.0);
+                            let lit = pow(ndotl, 0.85);
+                            let ecl = eclipse_illumination(world, radius * lz, i, sinfo.xy, sinfo.z, sinfo.w);
+                            let st = select(vec3<f32>(1.0), star_color_tint(em.spec.x), em.info.y == SPEC_BLACKBODY);
+                            direct_light = direct_light + st * (lit * em_norm) * ecl;
+                            if (has_atmo) {
+                                let fres = pow(1.0 - lz, 2.8) * smoothstep(0.0, 0.40, ndotl + 0.14);
+                                atmo_light = atmo_light + (rim_base * st) * (0.42 * fres * em_norm) * ecl;
+                            }
+                        }
                     }
+
+                    let planet_col = tex_rgb * (1.28 * direct_light + vec3<f32>(0.032)) + atmo_light;
                     col = mix(col, planet_col, cov);
                 }
             } else {
@@ -390,6 +429,21 @@ fn scene_overlay(world: vec2<f32>, px_world: f32, base_rgb: vec3<f32>) -> vec3<f
             let tint = select(vec3<f32>(0.08, 0.16, 0.24), vec3<f32>(0.28, 0.32, 0.38), cir.info.x == MAT_MIRROR);
             col = col + tint * alpha;
         }
+    }
+
+    // Optional drop-in rogue Schwarzschild black hole: abyssal horizon core + subtle Einstein photon ring.
+    if (u.bh.z > 0.0) {
+        let bh_m = u.bh.z;
+        let r_bh = length(world - u.bh.xy);
+        let r_hor = max(0.64 * bh_m, px_world * 2.5);
+        let r_ph = 1.8660254 * bh_m;
+        let hor_cov = 1.0 - smoothstep(r_hor - px_world, r_hor + px_world, r_bh);
+        col = mix(col, vec3<f32>(0.0), hor_cov);
+        let d_ph = abs(r_bh - r_ph);
+        let ph_w = max(px_world * 1.4, bh_m * 0.07);
+        col = col + vec3<f32>(0.45, 0.65, 1.0) * (0.20 * exp(-(d_ph * d_ph) / (ph_w * ph_w)));
+        let d_rim = abs(r_bh - r_hor);
+        col = col + vec3<f32>(0.95, 0.78, 0.48) * (0.32 * exp(-(d_rim * d_rim) / (line_w * line_w * 1.8)));
     }
 
     return col;
