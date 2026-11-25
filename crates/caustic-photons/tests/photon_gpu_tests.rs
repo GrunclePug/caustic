@@ -91,3 +91,72 @@ fn lavapipe_prism_and_kerr_beam_render_deterministically() {
         );
     }
 }
+
+#[test]
+fn blend_accumulation_unfreezes_after_convergence() {
+    let gpu = GpuContext::new_headless(true).expect("headless lavapipe Vulkan context");
+    let mut scene = PhotonScene::preset(PhotonSceneId::SolarSystem);
+    scene
+        .solar
+        .set_scale(caustic_photons::solar::SolarScale::Orrery);
+    scene.sync_solar_to_gpu(16.0 / 9.0);
+
+    let settings = PhotonSettings {
+        num_photons: 4_096,
+        substeps: 4,
+        mode: PhotonMode::Accumulate,
+        seed: 42,
+        ..PhotonSettings::default()
+    };
+
+    let mut pipeline = PhotonPipeline::new(
+        &gpu,
+        64,
+        36,
+        settings.num_photons,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+    );
+    let (_, telemetry) = pipeline
+        .render_headless(&gpu, &scene, &settings, 4)
+        .expect("converge paused frame");
+    assert_eq!(telemetry.accum_frames, 4);
+    assert!(
+        pipeline.is_converged(4),
+        "paused Steady simulation must report converged once accum_frames reaches threshold"
+    );
+
+    // Resuming orbital animation queues an EMA blend while accum_frames is still at the converged count.
+    pipeline.blend_accumulation();
+    assert!(
+        !pipeline.is_converged(4),
+        "blend_accumulation() must immediately exit converged idle state so live animation does not freeze"
+    );
+
+    // Encoding one blended frame consumes the pending EMA update and resets accum_frames to 1.
+    let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("blend-unfreeze-out"),
+        size: wgpu::Extent3d {
+            width: 64,
+            height: 36,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("blend-unfreeze-enc"),
+        });
+    pipeline.encode_frame(&gpu, &mut enc, &out_view, &scene, &settings, false);
+    gpu.queue.submit(Some(enc.finish()));
+    gpu.wait_idle().expect("gpu idle after blended frame");
+
+    assert_eq!(pipeline.accum_frames(), 1);
+    assert!(!pipeline.is_converged(4));
+}

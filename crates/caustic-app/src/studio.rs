@@ -2173,7 +2173,7 @@ impl StudioApp {
                 gfx.photon_pipeline.ensure_size(&gfx.gpu, w, h);
                 let converged = self.photon_settings.mode == PhotonMode::Accumulate
                     && !self.photon_settings.interactive_drag
-                    && gfx.photon_pipeline.accum_frames() >= MAX_CONVERGED_FRAMES;
+                    && gfx.photon_pipeline.is_converged(MAX_CONVERGED_FRAMES);
                 if converged {
                     gfx.photon_pipeline
                         .encode_present_only(&gfx.gpu, &mut enc, &view);

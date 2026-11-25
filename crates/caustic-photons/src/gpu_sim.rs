@@ -759,6 +759,11 @@ impl PhotonPipeline {
         self.accum_frames
     }
 
+    /// Returns `true` when accumulation has reached `max_frames` and no clear/blend update is queued.
+    pub fn is_converged(&self, max_frames: u64) -> bool {
+        self.pending_clear_mode == 0 && self.accum_frames >= max_frames
+    }
+
     /// Step `frames` frames headlessly and read back the final RGBA8 image + last-frame telemetry.
     pub fn render_headless(
         &mut self,

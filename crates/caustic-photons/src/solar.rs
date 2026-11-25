@@ -3,9 +3,10 @@
 //!
 //! All body radii, orbital semi-major axes, eccentricities, periods, Bond albedos,
 //! and ring bounds use exact NASA fact-sheet ratios (`1 AU = 149,597,870.7 km`).
-//! Supports both `1:1 Real` and `1:10 (KSP/KSA)` linear system scale—preserving every
-//! physical geometric ratio identically while letting users zoom seamlessly across
-//! 7 orders of magnitude (`40 AU` down to `4,000 km`).
+//! Supports both `Real (1:1)` exact NASA scale (letting users zoom seamlessly across
+//! 7 orders of magnitude from `40 AU` down to `4,000 km`) and an exaggerated `Orrery`
+//! cartoon scale where the Sun, all 8 planets, 3 moons, atmospheres, and Saturn's rings
+//! fit together on one screen.
 
 use crate::scene::{
     EMITTER_DISK, EMITTER_SOLAR_FAR, GpuEmitter, MAT_ATMOSPHERE, MAT_DIFFUSE, MAT_SPLITTER,
@@ -447,10 +448,10 @@ impl SolarSystem {
                 name: "Mercury",
                 radius_au: 0.16,
                 semi_major_au: 2.05,
-                eccentricity: 0.08,
+                eccentricity: 0.0,
                 period_s: 14.0,
-                arg_periapsis: 0.4,
-                mean_anomaly_0: 1.85,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: 2.25,
                 parent: None,
                 albedo: [0.36, 0.34, 0.32],
                 map_color: [168, 162, 156],
@@ -465,10 +466,10 @@ impl SolarSystem {
                 name: "Venus",
                 radius_au: 0.28,
                 semi_major_au: 3.10,
-                eccentricity: 0.01,
+                eccentricity: 0.0,
                 period_s: 24.0,
-                arg_periapsis: 0.8,
-                mean_anomaly_0: -1.55,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: -0.75,
                 parent: None,
                 albedo: [0.88, 0.78, 0.56],
                 map_color: [232, 200, 138],
@@ -483,7 +484,7 @@ impl SolarSystem {
                 name: "Earth",
                 radius_au: 0.38,
                 semi_major_au: 4.65,
-                eccentricity: 0.02,
+                eccentricity: 0.0,
                 period_s: 38.0,
                 arg_periapsis: 0.0,
                 mean_anomaly_0: 0.28,
@@ -502,10 +503,10 @@ impl SolarSystem {
                 name: "Moon",
                 radius_au: 0.13,
                 semi_major_au: 0.96,
-                eccentricity: 0.05,
+                eccentricity: 0.0,
                 period_s: 6.5,
-                arg_periapsis: 0.28,
-                mean_anomaly_0: 0.22,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: 0.50,
                 parent: Some(BODY_EARTH),
                 albedo: [0.58, 0.57, 0.54],
                 map_color: [195, 194, 190],
@@ -520,10 +521,10 @@ impl SolarSystem {
                 name: "Mars",
                 radius_au: 0.23,
                 semi_major_au: 6.15,
-                eccentricity: 0.07,
+                eccentricity: 0.0,
                 period_s: 56.0,
-                arg_periapsis: 0.5,
-                mean_anomaly_0: -2.45,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: -1.95,
                 parent: None,
                 albedo: [0.80, 0.36, 0.22],
                 map_color: [224, 118, 82],
@@ -538,7 +539,7 @@ impl SolarSystem {
                 name: "Jupiter",
                 radius_au: 0.60,
                 semi_major_au: 8.05,
-                eccentricity: 0.04,
+                eccentricity: 0.0,
                 period_s: 90.0,
                 arg_periapsis: 0.0,
                 mean_anomaly_0: 2.82,
@@ -556,7 +557,7 @@ impl SolarSystem {
                 name: "Io",
                 radius_au: 0.10,
                 semi_major_au: 1.02,
-                eccentricity: 0.005,
+                eccentricity: 0.0,
                 period_s: 4.8,
                 arg_periapsis: 0.0,
                 mean_anomaly_0: -0.35,
@@ -574,7 +575,7 @@ impl SolarSystem {
                 name: "Europa",
                 radius_au: 0.09,
                 semi_major_au: 1.42,
-                eccentricity: 0.01,
+                eccentricity: 0.0,
                 period_s: 8.4,
                 arg_periapsis: 0.0,
                 mean_anomaly_0: 1.9,
@@ -592,7 +593,7 @@ impl SolarSystem {
                 name: "Saturn",
                 radius_au: 0.50,
                 semi_major_au: 10.10,
-                eccentricity: 0.05,
+                eccentricity: 0.0,
                 period_s: 135.0,
                 arg_periapsis: 0.0,
                 mean_anomaly_0: -2.55,
@@ -610,7 +611,7 @@ impl SolarSystem {
                 name: "Uranus",
                 radius_au: 0.34,
                 semi_major_au: 11.95,
-                eccentricity: 0.04,
+                eccentricity: 0.0,
                 period_s: 185.0,
                 arg_periapsis: 0.0,
                 mean_anomaly_0: 2.52,
@@ -628,7 +629,7 @@ impl SolarSystem {
                 name: "Neptune",
                 radius_au: 0.33,
                 semi_major_au: 13.75,
-                eccentricity: 0.01,
+                eccentricity: 0.0,
                 period_s: 240.0,
                 arg_periapsis: 0.0,
                 mean_anomaly_0: -2.96,
@@ -1194,13 +1195,63 @@ mod tests {
             "invalid upstream spawn distance d_spawn={d_spawn}"
         );
 
-        // Verify exaggerated Orrery mode renders all planets, moons, atmospheres, and Saturn's rings in one view!
+        // Verify Real (1:1) Mercury genuinely places the Sun at a Keplerian focus (off-center by a*e).
+        let merc = sys.bodies[BODY_MERCURY];
+        let merc_pts = sys.sample_orbit_ellipse_au(BODY_MERCURY, 128);
+        let (min_x, max_x) = merc_pts
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                (lo.min(p[0]), hi.max(p[0]))
+            });
+        let (min_y, max_y) = merc_pts
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                (lo.min(p[1]), hi.max(p[1]))
+            });
+        let merc_mid_dist = (0.5 * (min_x + max_x)).hypot(0.5 * (min_y + max_y));
+        assert!(
+            (merc_mid_dist - merc.semi_major_au * merc.eccentricity).abs() < 2e-3,
+            "Real Mercury orbit center should be offset by a*e ({:.4}), got {:.4}",
+            merc.semi_major_au * merc.eccentricity,
+            merc_mid_dist
+        );
+
+        // Verify exaggerated Orrery mode renders all planets, moons, atmospheres, and Saturn's rings in one view,
+        // with clean circular planet orbits centered dead-on the Sun!
         sys.set_scale(SolarScale::Orrery);
         let orr = sys.compile_to_gpu(16.0 / 9.0);
         assert!(
             !orr.far_sun_mode,
             "Orrery system view must place Sun directly on screen"
         );
+        assert_eq!(
+            orr.body_gpu_pos[BODY_SUN],
+            [0.0, 0.0],
+            "Orrery Sun must sit dead-center at origin"
+        );
+        for (i, b) in sys.bodies.iter().enumerate().skip(1) {
+            if b.parent.is_some() {
+                continue;
+            }
+            let pts = sys.sample_orbit_ellipse_au(i, 64);
+            let (lo_x, hi_x) = pts
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                    (lo.min(p[0]), hi.max(p[0]))
+                });
+            let (lo_y, hi_y) = pts
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                    (lo.min(p[1]), hi.max(p[1]))
+                });
+            assert!(
+                (lo_x + hi_x).abs() < 1e-12 && (lo_y + hi_y).abs() < 1e-12,
+                "Orrery {} orbit ring should be centered on Sun, got mid=({:.3e}, {:.3e})",
+                b.name,
+                0.5 * (lo_x + hi_x),
+                0.5 * (lo_y + hi_y)
+            );
+        }
         assert!(
             orr.circles.len() >= 15,
             "expected all 8 planets + 3 moons + atmospheres in Orrery view, got {}",
