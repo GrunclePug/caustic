@@ -990,12 +990,14 @@ impl SolarSystem {
                 d_spawn_gpu = (proj_along_sun + gr * 2.5).min(sun_dist_gpu - sun_rad_gpu - 0.1);
             }
 
-            // Solid planet body (`MAT_DIFFUSE`).
+            // Solid planet body (`MAT_DIFFUSE`) tagged with its 2K equirectangular texture layer (`i + 1`)
+            // and live axial rotation angle (`material.w`).
+            let spin_angle = body_spin_angle(i, self.sim_time_s, self.scale);
             circles.push(OptCircle {
                 geom: [gp[0] as f32, gp[1] as f32, gr as f32, 0.0],
                 clip_arc: [0.0, 0.0, -2.0, 0.0],
-                material: [b.albedo[0], b.albedo[1], b.albedo[2], 0.0],
-                meta: [MAT_DIFFUSE, 0, 0, 0],
+                material: [b.albedo[0], b.albedo[1], b.albedo[2], spin_angle],
+                meta: [MAT_DIFFUSE, (i as u32) + 1, 0, 0],
             });
 
             // Optional Rayleigh atmosphere shell (`MAT_ATMOSPHERE`) with zoom-invariant optical depth!
@@ -1044,6 +1046,7 @@ impl SolarSystem {
                 ],
             }]
         } else {
+            let sun_spin = body_spin_angle(BODY_SUN, self.sim_time_s, self.scale);
             vec![GpuEmitter {
                 geom: [
                     body_gpu_pos[BODY_SUN][0] as f32,
@@ -1051,8 +1054,8 @@ impl SolarSystem {
                     0.0,
                     sun_rad_gpu as f32,
                 ],
-                spec: [5778.0, 1.0, 1.0, 0.0],
-                info: [EMITTER_DISK, SPEC_BLACKBODY, 0, 0],
+                spec: [5778.0, 1.0, 1.0, sun_spin],
+                info: [EMITTER_DISK, SPEC_BLACKBODY, 1, 0],
             }]
         };
 
@@ -1070,6 +1073,38 @@ impl SolarSystem {
             body_gpu_rad,
         }
     }
+}
+
+/// Compute visually expressive axial spin longitude (radians) for body `idx`.
+///
+/// Initial offsets orient each body's signature features (Earth's continents, Jupiter's Great Red Spot,
+/// Moon's near-side Maria, Io's Pele plume, Neptune's Great Dark Spot) toward the sunlit face.
+fn body_spin_angle(idx: usize, sim_time_s: f64, scale: SolarScale) -> f32 {
+    let (offset, real_period_s, orrery_period_s) = match idx {
+        BODY_SUN => (0.2, 25.38 * 86_400.0, 70.0),
+        BODY_MERCURY => (0.4, 58.65 * 86_400.0, 48.0),
+        BODY_VENUS => (0.6, -243.02 * 86_400.0, -52.0),
+        BODY_EARTH => (0.45, 86_164.1, 34.0),
+        BODY_MOON => (0.45, 27.321_661 * 86_400.0, 42.0),
+        BODY_MARS => (0.25, 88_642.7, 36.0),
+        BODY_JUPITER => (-0.52, 35_730.0, 26.0),
+        BODY_IO => (-1.15, 1.769_138 * 86_400.0, 32.0),
+        BODY_EUROPA => (0.3, 3.551_181 * 86_400.0, 38.0),
+        BODY_SATURN => (0.2, 38_362.0, 28.0),
+        BODY_URANUS => (0.1, -62_064.0, -40.0),
+        BODY_NEPTUNE => (0.25, 57_996.0, 36.0),
+        _ => (0.0, 86_400.0, 40.0),
+    };
+    let period: f64 = match scale {
+        SolarScale::Real1To1 => real_period_s,
+        SolarScale::Orrery => orrery_period_s,
+    };
+    let turns = if period.abs() > 1e-6 {
+        (sim_time_s / period).rem_euclid(1.0)
+    } else {
+        0.0
+    };
+    (offset + std::f64::consts::TAU * turns).rem_euclid(std::f64::consts::TAU) as f32
 }
 
 /// Format an astronomical distance (`au`) cleanly for Real 1:1 HUD telemetry.

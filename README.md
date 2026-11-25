@@ -25,7 +25,7 @@ GPU-accelerated photon playground and general-relativistic physics studio in pur
 
 ## Features
 
-* **Real (1:1) & Orrery Solar System modes**: Switch live between exact `1:1` NASA radii, J2000 mean semi-major axes, eccentricities, Kepler's Third Law periods, and Bond albedos for the Sun, all 8 planets, Moon, Io, Europa, and Saturn's rings (`1.28-2.35 R`), or an exaggerated `Orrery` view where the Sun, every planet, moon, Rayleigh atmosphere, and ring shadow fit together on one screen.
+* **Real (1:1) & Orrery Solar System modes**: Switch live between exact `1:1` NASA radii, J2000 mean semi-major axes, eccentricities, Kepler's Third Law periods, and Bond albedos for the Sun, all 8 planets, Moon, Io, Europa, and Saturn's rings (`1.28-2.35 R`), or an exaggerated `Orrery` view where the Sun, every planet, moon, Rayleigh atmosphere, and ring shadow fit together on one screen — all rendered with real 2K spacecraft textures, mipmapped 3D sphere lighting, live axial rotation, Cassini ring banding, and eclipse umbra/penumbra shading.
 * **Floating-origin camera & frustum-sampled sunlight**: Computes camera-relative `f64` coordinates before GPU upload and switches automatically to frustum importance-sampled finite-angular-disk `5778 K` sunlight (`0.533 deg` at Earth, `0.056 deg` at Saturn, `0.018 deg` at Neptune), enabling seamless zoom across more than six orders of magnitude (`90 AU` down to `7,500 km`) with true total/annular solar eclipses, Rayleigh-refracted lunar eclipses, Saturn ring shadows, and Io transits.
 * **KSP/KSA map view & staged astronomical events**: Draws live Keplerian orbit ellipses, clickable body reticles, logarithmic time warp (`1x` to `30d/s`), live telemetry (view height, Sun distance, solar angular diameter, and light-travel delay), and one-click presets for `Lunar Eclipse`, `Solar Eclipse`, `Saturn Rings`, and `Io Transit`.
 * **Multi-emitter physical light sources**: Combine up to 16 simultaneous emitters (`Beam`, `Point`, `Spotlight`, `Star Disk`) with equal-energy white, true Planck blackbody temperatures (`2000-15000 K`), or monochromatic lasers (`400-700 nm`).
@@ -138,6 +138,11 @@ make photons-bench
 make render
 make clean
 ```
+
+## Texture Credits
+
+* **Sun, Mercury, Venus, Earth (+ Clouds), Moon, Mars, Jupiter, Saturn (+ Rings), Uranus, Neptune**: [Solar System Scope Textures](https://www.solarsystemscope.com/textures/) (NASA elevation and spacecraft imagery, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)).
+* **Io & Europa**: NASA / JPL / USGS Galileo and Voyager global mosaics (Public Domain / CC0 via Wikimedia Commons). See [crates/caustic-photons/assets/planets/CREDITS.md](crates/caustic-photons/assets/planets/CREDITS.md).
 
 ## Contributing
 

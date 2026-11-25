@@ -33,6 +33,7 @@ log = "0.4.35"
 png = "0.18.1"
 wgpu = { version = "30.0.2", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
 winit = "0.30.13"
+zune-jpeg = "0.5.15"
 
 caustic-core = { path = "crates/caustic-core" }
 caustic-blackhole = { path = "crates/caustic-blackhole" }

@@ -13,5 +13,6 @@ pub mod gpu_sim;
 pub mod grin;
 pub mod ingoing_kerr;
 pub mod optics;
+pub mod planets;
 pub mod scene;
 pub mod solar;

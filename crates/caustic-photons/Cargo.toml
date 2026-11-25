@@ -15,7 +15,9 @@ anyhow.workspace = true
 bytemuck.workspace = true
 caustic-core.workspace = true
 glam.workspace = true
+png.workspace = true
 wgpu.workspace = true
+zune-jpeg.workspace = true
 
 [dev-dependencies]
 caustic-blackhole.workspace = true

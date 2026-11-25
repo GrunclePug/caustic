@@ -834,12 +834,27 @@ impl PhotonScene {
                     ring_outer,
                     ..
                 } => {
-                    // Solid planetary body (diffuse Lambertian reflector).
+                    // Solid planetary body (diffuse Lambertian reflector) with matching 2K planet map.
+                    let tex_id = if ring_outer > radius * 1.15 {
+                        (crate::solar::BODY_SATURN as u32) + 1
+                    } else if albedo[0] > 0.55 && albedo[2] < 0.30 {
+                        (crate::solar::BODY_MARS as u32) + 1
+                    } else if atmo_thickness > 0.02 && albedo[2] > albedo[0] {
+                        if albedo[1] > 0.65 {
+                            (crate::solar::BODY_URANUS as u32) + 1
+                        } else {
+                            (crate::solar::BODY_EARTH as u32) + 1
+                        }
+                    } else if atmo_thickness <= 0.02 {
+                        (crate::solar::BODY_MOON as u32) + 1
+                    } else {
+                        (crate::solar::BODY_NEPTUNE as u32) + 1
+                    };
                     self.circles.push(OptCircle {
                         geom: [el.pos[0], el.pos[1], radius, 0.0],
                         clip_arc: [0.0, 0.0, -2.0, 0.0],
-                        material: [albedo[0], albedo[1], albedo[2], 0.0],
-                        meta: [MAT_DIFFUSE, 0, 0, 0],
+                        material: [albedo[0], albedo[1], albedo[2], 0.45],
+                        meta: [MAT_DIFFUSE, tex_id, 0, 0],
                     });
                     // Optional Rayleigh atmosphere shell.
                     if atmo_thickness > 0.02 && atmo_density > 0.01 {

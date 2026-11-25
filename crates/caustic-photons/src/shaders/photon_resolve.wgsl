@@ -1,6 +1,7 @@
 // Pass 2: Resolve fixed-point atomic<u32> spectral CIE XYZ buffer into linear Rec.709 HDR,
 // clear atomic deposits for the next frame, apply accumulation or pulse persistence decay,
-// and draw subtle optical element, planetary body, star disk, GRIN, or Kerr guides.
+// and render optical elements, real 2K textured 3D-lit planets/moons/Sun with eclipse shadows,
+// Cassini-banded rings, GRIN fields, and Kerr horizons.
 
 struct ResolveUniforms {
     // xy = view_center, z = view_half_height, w = aspect
@@ -11,7 +12,7 @@ struct ResolveUniforms {
     kerr: vec4<f32>,
     // x = width, y = height, z = physics_kind, w = mode (0=Accumulate, 1=Pulse)
     dims: vec4<u32>,
-    // x = num_segments, y = num_circles, z = clear_hdr (0/1), w = num_emitters
+    // x = num_segments, y = num_circles, z = clear_hdr (0/1/2), w = num_emitters
     counts: vec4<u32>,
 };
 
@@ -41,6 +42,12 @@ struct GpuEmitter {
 @group(0) @binding(4) var<storage, read> segments: array<OptSegment>;
 @group(0) @binding(5) var<storage, read> circles: array<OptCircle>;
 @group(0) @binding(6) var<storage, read> emitters: array<GpuEmitter>;
+@group(0) @binding(7) var planet_tex: texture_2d_array<f32>;
+@group(0) @binding(8) var planet_sampler: sampler;
+@group(0) @binding(9) var ring_tex: texture_2d<f32>;
+
+const PI: f32 = 3.14159265;
+const TAU: f32 = 6.28318530;
 
 const PHYS_OPTICS: u32 = 0u;
 const PHYS_KERR: u32 = 1u;
@@ -55,6 +62,7 @@ const MAT_ATMOSPHERE: u32 = 5u;
 const MAT_SPLITTER: u32 = 6u;
 
 const EMITTER_DISK: u32 = 3u;
+const EMITTER_SOLAR_FAR: u32 = 4u;
 const SPEC_BLACKBODY: u32 = 1u;
 
 const LUNEBURG_R: f32 = 3.2;
@@ -93,8 +101,107 @@ fn star_color_tint(temp_k: f32) -> vec3<f32> {
     return select(mix(sun, hot, (t - 0.35) / 0.65), mix(warm, sun, t / 0.35), t < 0.35);
 }
 
-fn scene_overlay(world: vec2<f32>, px_world: f32) -> vec3<f32> {
-    var col = vec3<f32>(0.0);
+// Returns xy = unit vector from `pt` toward primary Sun/light source, z = solar angular radius (rad), w = distance.
+fn primary_light_info(pt: vec2<f32>) -> vec4<f32> {
+    if (u.counts.w == 0u) {
+        return vec4<f32>(-1.0, 0.0, 0.005, 1e5);
+    }
+    let em = emitters[0];
+    if (em.info.x == EMITTER_SOLAR_FAR) {
+        let sdir = vec2<f32>(cos(em.geom.z), sin(em.geom.z));
+        return vec4<f32>(-sdir, max(em.spec.w, 1e-4), 1e6);
+    }
+    let to_sun = em.geom.xy - pt;
+    let dist = max(length(to_sun), 1e-5);
+    let dir = to_sun / dist;
+    let rad = select(0.03, max(em.geom.w, 1e-5), em.info.x == EMITTER_DISK);
+    let ang = atan2(rad, max(dist, rad));
+    return vec4<f32>(dir, ang, dist);
+}
+
+// Compute real-time 3D RGB solar illumination at 3D sphere point `(pt, z_height)` for ecliptic sunlight,
+// accounting for 3D spherical umbra/penumbra eclipses, Rayleigh red lunar eclipses, and Cassini ring shadows.
+fn eclipse_illumination(pt: vec2<f32>, z_height: f32, self_idx: u32, sun_dir: vec2<f32>, sun_ang_r: f32, sun_dist: f32) -> vec3<f32> {
+    var illum = vec3<f32>(1.0);
+    let perp_axis = vec2<f32>(-sun_dir.y, sun_dir.x);
+
+    for (var j = 0u; j < u.counts.y; j = j + 1u) {
+        if (j == self_idx) {
+            continue;
+        }
+        let occ = circles[j];
+        if (occ.info.x != MAT_DIFFUSE) {
+            continue;
+        }
+        let d = occ.geom.xy - pt;
+        let t_along = dot(d, sun_dir);
+        if (t_along <= 0.0 || t_along >= sun_dist) {
+            continue;
+        }
+        let perp_xy = dot(d, perp_axis);
+        let perp_3d = sqrt(perp_xy * perp_xy + z_height * z_height);
+        let occ_ang = occ.geom.z / t_along;
+        let sep_ang = perp_3d / t_along;
+        if (sep_ang < occ_ang + sun_ang_r) {
+            let edge_in = max(occ_ang - sun_ang_r, 0.0);
+            let edge_out = occ_ang + sun_ang_r;
+            let frac = 1.0 - smoothstep(edge_in, edge_out, sep_ang);
+            let max_cov = min((occ_ang * occ_ang) / max(sun_ang_r * sun_ang_r, 1e-8), 1.0);
+            let cov = frac * max_cov;
+            let has_atmo = (j + 1u < u.counts.y) && (circles[j + 1u].info.x == MAT_ATMOSPHERE);
+            if (has_atmo) {
+                // Refracted sunset copper-red glow inside an atmospheric planet's lunar umbra.
+                let umbra_tint = vec3<f32>(0.44, 0.07, 0.02);
+                illum = illum * mix(vec3<f32>(1.0), umbra_tint, cov);
+            } else {
+                // Crisp dark umbra cast by airless moons (Moon on Earth, Io on Jupiter).
+                illum = illum * (1.0 - cov * 0.96);
+            }
+        }
+    }
+
+    // Translucent Cassini-banded shadow cast by upstream planetary ring segments.
+    for (var s = 0u; s < u.counts.x; s = s + 1u) {
+        let seg = segments[s];
+        if (seg.info.x != MAT_SPLITTER || seg.info.y != 1u) {
+            continue;
+        }
+        let a = seg.endpoints.xy;
+        let ab = seg.endpoints.zw - a;
+        let denom = sun_dir.x * ab.y - sun_dir.y * ab.x;
+        if (abs(denom) < 1e-7) {
+            continue;
+        }
+        let ap = a - pt;
+        let t_ray = (ap.x * ab.y - ap.y * ab.x) / denom;
+        let u_seg = (ap.x * sun_dir.y - ap.y * sun_dir.x) / denom;
+        if (t_ray > 1e-4 && t_ray < sun_dist && u_seg >= 0.0 && u_seg <= 1.0) {
+            let ring_s = textureSampleLevel(ring_tex, planet_sampler, vec2<f32>(clamp(u_seg, 0.002, 0.998), 0.5), 0.0);
+            illum = illum * (1.0 - ring_s.a * 0.62);
+        }
+    }
+
+    return illum;
+}
+
+// Sample a 2K equirectangular planet/Sun texture on a 3D unit hemisphere with analytical mipmap LOD.
+fn sample_sphere_tex(lp: vec2<f32>, lz: f32, spin_angle: f32, tilt: f32, layer: i32, rad_px: f32) -> vec3<f32> {
+    let ct = cos(tilt);
+    let st = sin(tilt);
+    let nx = lp.x;
+    let ny = lp.y * ct + lz * st;
+    let nz = -lp.y * st + lz * ct;
+    let lon = atan2(nx, nz) + spin_angle;
+    let lat = asin(clamp(ny, -1.0, 1.0));
+    let u_tex = fract(lon / TAU + 0.5);
+    let v_tex = clamp(0.5 - lat / PI, 0.001, 0.999);
+    let tex_w = f32(textureDimensions(planet_tex).x);
+    let lod = clamp(log2(tex_w / max(TAU * rad_px, 1.0)), 0.0, 10.0);
+    return textureSampleLevel(planet_tex, planet_sampler, vec2<f32>(u_tex, v_tex), layer, lod).rgb;
+}
+
+fn scene_overlay(world: vec2<f32>, px_world: f32, base_rgb: vec3<f32>) -> vec3<f32> {
+    var col = base_rgb;
     let line_w = px_world * 1.4;
     let phys = u.dims.z;
 
@@ -140,31 +247,35 @@ fn scene_overlay(world: vec2<f32>, px_world: f32) -> vec3<f32> {
         return col;
     }
 
-    // Glowing star / Sun disks for EMITTER_DISK emitters.
-    for (var i = 0u; i < u.counts.w; i = i + 1u) {
-        let em = emitters[i];
-        if (em.info.x == EMITTER_DISK) {
-            let r = length(world - em.geom.xy);
-            let true_rad = max(em.geom.w, 1e-6);
-            let vis_rad = max(true_rad, px_world * 2.5);
-            let tint = select(vec3<f32>(1.0, 0.96, 0.88), star_color_tint(em.spec.x), em.info.y == SPEC_BLACKBODY);
-            if (r <= vis_rad) {
-                let mu = sqrt(max(1.0 - (r * r) / (vis_rad * vis_rad), 0.0));
-                // Subtle physical limb darkening across the solar photosphere.
-                let limb = 0.45 + 0.55 * mu;
-                col = col + tint * (3.8 * limb);
-            } else {
-                let d = r - vis_rad;
-                let halo_w = max(true_rad * 0.28, px_world * 10.0);
-                col = col + tint * (0.45 * exp(-d / halo_w));
-            }
-        }
-    }
-
-    // Optical segments: glass, mirrors, beam splitters, icy rings, matte walls, absorbers.
+    // Optical segments: glass, mirrors, beam splitters, Cassini-banded icy rings, matte walls, absorbers.
     for (var i = 0u; i < u.counts.x; i = i + 1u) {
         let seg = segments[i];
-        let d = dist_to_segment(world, seg.endpoints.xy, seg.endpoints.zw);
+        let a = seg.endpoints.xy;
+        let b = seg.endpoints.zw;
+        let ab = b - a;
+        let ab_len2 = max(dot(ab, ab), 1e-10);
+        let t_seg = clamp(dot(world - a, ab) / ab_len2, 0.0, 1.0);
+        let d = length(world - (a + ab * t_seg));
+
+        if (seg.info.x == MAT_SPLITTER && seg.info.y == 1u) {
+            // Real Cassini radial ring banding (C, B, Cassini Division, A rings) with Saturn shadow.
+            let ring_w = max(px_world * 2.2, sqrt(ab_len2) * 0.052);
+            if (d < ring_w * 3.0) {
+                let ring_s = textureSampleLevel(
+                    ring_tex,
+                    planet_sampler,
+                    vec2<f32>(clamp(t_seg, 0.002, 0.998), 0.5),
+                    0.0,
+                );
+                let sinfo = primary_light_info(world);
+                let ecl = eclipse_illumination(world, 0.0, 9999u, sinfo.xy, sinfo.z, sinfo.w);
+                let prof = exp(-(d * d) / (ring_w * ring_w));
+                let ring_lit = ring_s.rgb * (1.35 * ecl + vec3<f32>(0.05));
+                col = col + ring_lit * (ring_s.a * prof);
+            }
+            continue;
+        }
+
         let alpha = exp(-(d * d) / (line_w * line_w));
         var tint = vec3<f32>(0.08, 0.16, 0.24);
         if (seg.info.x == MAT_MIRROR) {
@@ -174,12 +285,46 @@ fn scene_overlay(world: vec2<f32>, px_world: f32) -> vec3<f32> {
         } else if (seg.info.x == MAT_DIFFUSE) {
             tint = seg.material.xyz * 0.28 + vec3<f32>(0.05);
         } else if (seg.info.x == MAT_SPLITTER) {
-            tint = select(vec3<f32>(0.16, 0.32, 0.40), seg.material.xyz * 0.30, seg.info.y == 1u);
+            tint = vec3<f32>(0.16, 0.32, 0.40);
         }
         col = col + tint * alpha;
     }
 
-    // Circular optics, planets, and subtle atmospheric shells.
+    // Glowing star / Sun disks for EMITTER_DISK emitters (with 2K solar photosphere granulation when tagged).
+    for (var i = 0u; i < u.counts.w; i = i + 1u) {
+        let em = emitters[i];
+        if (em.info.x == EMITTER_DISK) {
+            let v = world - em.geom.xy;
+            let r = length(v);
+            let true_rad = max(em.geom.w, 1e-6);
+            let vis_rad = max(true_rad, px_world * 2.5);
+            let tint = select(vec3<f32>(1.0, 0.96, 0.88), star_color_tint(em.spec.x), em.info.y == SPEC_BLACKBODY);
+            let rad_px = vis_rad / px_world;
+            if (r <= vis_rad + px_world) {
+                let cov = 1.0 - smoothstep(vis_rad - px_world * 0.75, vis_rad + px_world * 0.75, r);
+                let lp = v / vis_rad;
+                let lz = sqrt(max(1.0 - min(dot(lp, lp), 1.0), 0.0));
+                if (em.info.z == 1u && rad_px > 5.0) {
+                    let sun_tex = sample_sphere_tex(lp, lz, em.spec.w, 0.18, 0, rad_px);
+                    let limb = 0.42 + 0.58 * pow(lz, 0.55);
+                    // Preserve fiery SDO granulation & active regions through AgX without flattening to solid white.
+                    let photosphere = sun_tex * (1.25 + 1.45 * limb) + vec3<f32>(0.22, 0.11, 0.025) * (lz * lz);
+                    col = mix(col, photosphere, cov);
+                } else {
+                    let limb = 0.45 + 0.55 * lz;
+                    col = mix(col, tint * (3.6 * limb), cov);
+                }
+            }
+            if (r > vis_rad - px_world) {
+                let d = max(r - vis_rad, 0.0);
+                let halo_w = max(true_rad * 0.30, px_world * 10.0);
+                let corona_tint = select(tint, vec3<f32>(1.0, 0.78, 0.42), em.info.z == 1u && rad_px > 5.0);
+                col = col + corona_tint * (0.42 * exp(-d / halo_w));
+            }
+        }
+    }
+
+    // Circular optics, 2K textured 3D-lit planets/moons, and subtle atmospheric shells.
     for (var i = 0u; i < u.counts.y; i = i + 1u) {
         let cir = circles[i];
         let center = cir.geom.xy;
@@ -192,30 +337,56 @@ fn scene_overlay(world: vec2<f32>, px_world: f32) -> vec3<f32> {
 
         let v = world - center;
         let len = length(v);
-        if (len < 1e-6) {
-            continue;
-        }
-        let n_out = v / len;
         if (clip_r > 0.0) {
             let dc = world - clip_c;
             if (dot(dc, dc) > (clip_r + line_w) * (clip_r + line_w)) {
                 continue;
             }
         }
-        if (arc_cos > -1.5 && dot(n_out, arc_dir) < arc_cos) {
+        if (arc_cos > -1.5 && len > 1e-6 && dot(v / len, arc_dir) < arc_cos) {
             continue;
         }
-        let d = abs(len - radius);
-        let alpha = exp(-(d * d) / (line_w * line_w));
+
         if (cir.info.x == MAT_DIFFUSE) {
-            // Subtle shaded planet silhouette + rim.
-            if (len < radius) {
-                col = col + cir.material.xyz * 0.055;
+            if (cir.info.y > 0u) {
+                if (len <= radius + px_world) {
+                    let cov = 1.0 - smoothstep(radius - px_world * 0.75, radius + px_world * 0.75, len);
+                    let lp = v / max(radius, 1e-6);
+                    let lz = sqrt(max(1.0 - min(dot(lp, lp), 1.0), 0.0));
+                    let rad_px = radius / px_world;
+                    let layer = i32(cir.info.y - 1u);
+                    let tex_rgb = sample_sphere_tex(lp, lz, cir.material.w, 0.28, layer, rad_px);
+
+                    let sinfo = primary_light_info(center);
+                    let sun_3d = normalize(vec3<f32>(sinfo.x, sinfo.y, 0.22));
+                    let ndotl = max(dot(vec3<f32>(lp.x, lp.y, lz), sun_3d), 0.0);
+                    let lit = pow(ndotl, 0.85);
+                    let ecl = eclipse_illumination(world, radius * lz, i, sinfo.xy, sinfo.z, sinfo.w);
+
+                    var planet_col = tex_rgb * (1.28 * lit * ecl + vec3<f32>(0.032));
+                    let has_atmo = (i + 1u < u.counts.y) && (circles[i + 1u].info.x == MAT_ATMOSPHERE);
+                    if (has_atmo) {
+                        let fres = pow(1.0 - lz, 2.8) * smoothstep(0.0, 0.40, ndotl + 0.14);
+                        let rim_tint = mix(cir.material.xyz, vec3<f32>(0.26, 0.58, 1.0), 0.45);
+                        planet_col = planet_col + rim_tint * (0.42 * fres) * ecl;
+                    }
+                    col = mix(col, planet_col, cov);
+                }
+            } else {
+                let d = abs(len - radius);
+                let alpha = exp(-(d * d) / (line_w * line_w));
+                if (len < radius) {
+                    col = col + cir.material.xyz * 0.055;
+                }
+                col = col + (cir.material.xyz * 0.28 + vec3<f32>(0.04)) * alpha;
             }
-            col = col + (cir.material.xyz * 0.28 + vec3<f32>(0.04)) * alpha;
         } else if (cir.info.x == MAT_ATMOSPHERE) {
-            col = col + vec3<f32>(0.012, 0.032, 0.075) * alpha;
+            let d = abs(len - radius);
+            let alpha = exp(-(d * d) / (line_w * line_w));
+            col = col + vec3<f32>(0.005, 0.014, 0.034) * alpha;
         } else {
+            let d = abs(len - radius);
+            let alpha = exp(-(d * d) / (line_w * line_w));
             let tint = select(vec3<f32>(0.08, 0.16, 0.24), vec3<f32>(0.28, 0.32, 0.38), cir.info.x == MAT_MIRROR);
             col = col + tint * alpha;
         }
@@ -283,10 +454,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             rgb = vec3<f32>(0.0);
         }
     } else {
-        // Mask solid diffuse planet interiors so grazing steps don't bleed inside solid rock.
+        // Mask solid untextured planet interiors (textured planets composite smoothly over photon splats).
         for (var i = 0u; i < u.counts.y; i = i + 1u) {
             let cir = circles[i];
-            if (cir.info.x == MAT_DIFFUSE) {
+            if (cir.info.x == MAT_DIFFUSE && cir.info.y == 0u) {
                 let v = world - cir.geom.xy;
                 if (dot(v, v) < (cir.geom.z - px_world * 0.5) * (cir.geom.z - px_world * 0.5)) {
                     rgb = vec3<f32>(0.0);
@@ -294,7 +465,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
-    rgb = rgb + scene_overlay(world, px_world);
+    rgb = scene_overlay(world, px_world, rgb);
 
     textureStore(hdr_out, vec2<i32>(gid.xy), vec4<f32>(min(rgb, vec3<f32>(60000.0)), 1.0));
 }

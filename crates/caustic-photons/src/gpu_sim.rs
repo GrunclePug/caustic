@@ -11,6 +11,7 @@ use caustic_core::spectrum::build_spectral_xyz_lut;
 use wgpu::util::DeviceExt;
 
 use crate::ingoing_kerr::r_plus;
+use crate::planets::PlanetTextures;
 use crate::scene::{
     GpuEmitter, MAX_EMITTERS, OptCircle, OptSegment, PhotonMode, PhotonScene, PhysicsKind,
 };
@@ -139,6 +140,7 @@ pub struct PhotonPipeline {
     segments_buf: wgpu::Buffer,
     circles_buf: wgpu::Buffer,
     emitters_buf: wgpu::Buffer,
+    planet_textures: PlanetTextures,
     sized: SizedBuffers,
     timers: Option<GpuTimers>,
     frame_idx: u32,
@@ -208,6 +210,32 @@ impl PhotonPipeline {
                     bgl_buf(4, wgpu::BufferBindingType::Storage { read_only: true }),
                     bgl_buf(5, wgpu::BufferBindingType::Storage { read_only: true }),
                     bgl_buf(6, wgpu::BufferBindingType::Storage { read_only: true }),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -298,6 +326,8 @@ impl PhotonPipeline {
             mapped_at_creation: false,
         });
 
+        let planet_textures = PlanetTextures::upload(gpu);
+
         let sized = Self::create_sized(
             gpu,
             width.max(1),
@@ -312,6 +342,7 @@ impl PhotonPipeline {
             &segments_buf,
             &circles_buf,
             &emitters_buf,
+            &planet_textures,
         );
         let timers = GpuTimers::new(gpu);
 
@@ -329,6 +360,7 @@ impl PhotonPipeline {
             segments_buf,
             circles_buf,
             emitters_buf,
+            planet_textures,
             sized,
             timers,
             frame_idx: 0,
@@ -356,6 +388,7 @@ impl PhotonPipeline {
         segments_buf: &wgpu::Buffer,
         circles_buf: &wgpu::Buffer,
         emitters_buf: &wgpu::Buffer,
+        planet_textures: &PlanetTextures,
     ) -> SizedBuffers {
         let num_px = u64::from(width) * u64::from(height);
         let accum_xyz_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -413,6 +446,18 @@ impl PhotonPipeline {
                 bg_buf(4, segments_buf),
                 bg_buf(5, circles_buf),
                 bg_buf(6, emitters_buf),
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&planet_textures.planet_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&planet_textures.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&planet_textures.ring_view),
+                },
             ],
         });
         let agx_bg = agx_pass.create_bind_group(gpu, &hdr_view);
@@ -450,6 +495,7 @@ impl PhotonPipeline {
             &self.segments_buf,
             &self.circles_buf,
             &self.emitters_buf,
+            &self.planet_textures,
         );
         self.reset_accumulation();
     }

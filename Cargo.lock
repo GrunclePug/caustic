@@ -371,7 +371,9 @@ dependencies = [
  "caustic-blackhole",
  "caustic-core",
  "glam",
+ "png",
  "wgpu",
+ "zune-jpeg",
 ]
 
 [[package]]
