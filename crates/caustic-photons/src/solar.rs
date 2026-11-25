@@ -23,29 +23,26 @@ pub const YEAR_S: f64 = 31_557_600.0;
 /// Exact solar mean radius in AU (`696,340 km / AU`).
 pub const SUN_RADIUS_AU: f64 = 696_340.0 / AU_KM;
 
-/// Uniform system scale factor (both radii AND distances scale identically -> exact ratios!).
+/// System scale mode: exact 1:1 NASA true-ratio Solar System vs exaggerated Orrery (cartoon) scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolarScale {
-    /// Exact 1:1 real-world Solar System (`1 AU = 149.6M km`, light-time `8m 19s`).
+    /// Exact 1:1 real-world NASA Solar System (`1 AU = 149.6M km`, light-time `8m 19s`).
     Real1To1,
-    /// KSP/KSA-style 1/10th linear scale (`1 AU = 14.96M km`, light-time `49.9s`, identical ratios!).
-    Scaled1To10,
+    /// Exaggerated cartoon / orrery scale where the Sun, all 8 planets, moons, rings,
+    /// thick Rayleigh atmospheres, and big dramatic shadows fit together on one screen.
+    Orrery,
 }
 
 impl SolarScale {
-    /// Linear scale factor applied to physical lengths (km) and light-travel times.
-    pub fn factor(self) -> f64 {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Real1To1 => 1.0,
-            Self::Scaled1To10 => 0.1,
+            Self::Real1To1 => "Real (1:1)",
+            Self::Orrery => "Orrery",
         }
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Real1To1 => "1:1 Real",
-            Self::Scaled1To10 => "1:10 (KSP/KSA)",
-        }
+    pub fn is_orrery(self) -> bool {
+        self == Self::Orrery
     }
 }
 
@@ -178,10 +175,29 @@ impl Default for SolarSystem {
 }
 
 impl SolarSystem {
-    /// Construct our exact-ratio Solar System starting framed on an iconic Earth + Moon Solar Eclipse!
+    /// Construct our exact-ratio Solar System starting framed on an iconic Earth + Moon Lunar Eclipse.
     pub fn new() -> Self {
+        let bodies = Self::real_bodies();
+        let n = bodies.len();
+        let mut s = Self {
+            bodies,
+            scale: SolarScale::Real1To1,
+            focus: SolarFocus::Body(BODY_EARTH),
+            sim_time_s: 0.0,
+            time_warp: 3_600.0,
+            view_half_height_au: 0.000_25,
+            pan_offset_au: [0.0, 0.0],
+            positions_au: vec![[0.0, 0.0]; n],
+        };
+        s.update_positions();
+        s.stage_lunar_eclipse();
+        s
+    }
+
+    /// Exact NASA 1:1 true-ratio Solar System catalog (units in AU and real seconds).
+    fn real_bodies() -> Vec<SolarBody> {
         let km = |r_km: f64| r_km / AU_KM;
-        let bodies = vec![
+        vec![
             SolarBody {
                 name: "Sun",
                 radius_au: SUN_RADIUS_AU,
@@ -402,23 +418,264 @@ impl SolarSystem {
                 ring_outer_mult: 0.0,
                 ring_angle: 0.0,
             },
-        ];
-        let n = bodies.len();
-        let mut s = Self {
-            bodies,
-            scale: SolarScale::Real1To1,
-            focus: SolarFocus::Body(BODY_EARTH),
-            sim_time_s: 0.0,
-            time_warp: 3_600.0, // 1 hour/sec (visible lunar motion!)
-            view_half_height_au: 0.000_25,
-            pan_offset_au: [0.0, 0.0],
-            positions_au: vec![[0.0, 0.0]; n],
+        ]
+    }
+
+    /// Exaggerated cartoon / orrery Solar System catalog where the Sun, all 8 planets, 3 moons,
+    /// thick Rayleigh atmospheres, and Saturn's icy rings all shine and cast shadows on one screen.
+    fn orrery_bodies() -> Vec<SolarBody> {
+        vec![
+            SolarBody {
+                name: "Sun",
+                radius_au: 1.05,
+                semi_major_au: 0.0,
+                eccentricity: 0.0,
+                period_s: 0.0,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: 0.0,
+                parent: None,
+                albedo: [1.0, 0.96, 0.86],
+                map_color: [255, 224, 150],
+                atmo_thickness: 0.0,
+                atmo_tau_per_r: 0.0,
+                atmo_n_delta: 0.0,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+            SolarBody {
+                name: "Mercury",
+                radius_au: 0.16,
+                semi_major_au: 2.05,
+                eccentricity: 0.08,
+                period_s: 14.0,
+                arg_periapsis: 0.4,
+                mean_anomaly_0: 1.85,
+                parent: None,
+                albedo: [0.36, 0.34, 0.32],
+                map_color: [168, 162, 156],
+                atmo_thickness: 0.0,
+                atmo_tau_per_r: 0.0,
+                atmo_n_delta: 0.0,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+            SolarBody {
+                name: "Venus",
+                radius_au: 0.28,
+                semi_major_au: 3.10,
+                eccentricity: 0.01,
+                period_s: 24.0,
+                arg_periapsis: 0.8,
+                mean_anomaly_0: -1.55,
+                parent: None,
+                albedo: [0.88, 0.78, 0.56],
+                map_color: [232, 200, 138],
+                atmo_thickness: 0.34,
+                atmo_tau_per_r: 1.35,
+                atmo_n_delta: 0.032,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+            SolarBody {
+                name: "Earth",
+                radius_au: 0.38,
+                semi_major_au: 4.65,
+                eccentricity: 0.02,
+                period_s: 38.0,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: 0.28,
+                parent: None,
+                albedo: [0.28, 0.52, 0.80],
+                map_color: [108, 174, 245],
+                // Lush visible Rayleigh sky + vivid sunset red refraction into lunar umbra!
+                atmo_thickness: 0.48,
+                atmo_tau_per_r: 1.30,
+                atmo_n_delta: 0.042,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+            SolarBody {
+                name: "Moon",
+                radius_au: 0.13,
+                semi_major_au: 0.96,
+                eccentricity: 0.05,
+                period_s: 6.5,
+                arg_periapsis: 0.28,
+                mean_anomaly_0: 0.22,
+                parent: Some(BODY_EARTH),
+                albedo: [0.58, 0.57, 0.54],
+                map_color: [195, 194, 190],
+                atmo_thickness: 0.0,
+                atmo_tau_per_r: 0.0,
+                atmo_n_delta: 0.0,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+            SolarBody {
+                name: "Mars",
+                radius_au: 0.23,
+                semi_major_au: 6.15,
+                eccentricity: 0.07,
+                period_s: 56.0,
+                arg_periapsis: 0.5,
+                mean_anomaly_0: -2.45,
+                parent: None,
+                albedo: [0.80, 0.36, 0.22],
+                map_color: [224, 118, 82],
+                atmo_thickness: 0.22,
+                atmo_tau_per_r: 0.55,
+                atmo_n_delta: 0.012,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+            SolarBody {
+                name: "Jupiter",
+                radius_au: 0.60,
+                semi_major_au: 8.05,
+                eccentricity: 0.04,
+                period_s: 90.0,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: 2.82,
+                parent: None,
+                albedo: [0.78, 0.64, 0.48],
+                map_color: [218, 184, 142],
+                atmo_thickness: 0.14,
+                atmo_tau_per_r: 0.65,
+                atmo_n_delta: 0.015,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+            SolarBody {
+                name: "Io",
+                radius_au: 0.10,
+                semi_major_au: 1.02,
+                eccentricity: 0.005,
+                period_s: 4.8,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: -0.35,
+                parent: Some(BODY_JUPITER),
+                albedo: [0.86, 0.76, 0.36],
+                map_color: [232, 206, 108],
+                atmo_thickness: 0.0,
+                atmo_tau_per_r: 0.0,
+                atmo_n_delta: 0.0,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+            SolarBody {
+                name: "Europa",
+                radius_au: 0.09,
+                semi_major_au: 1.42,
+                eccentricity: 0.01,
+                period_s: 8.4,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: 1.9,
+                parent: Some(BODY_JUPITER),
+                albedo: [0.78, 0.75, 0.70],
+                map_color: [210, 204, 192],
+                atmo_thickness: 0.0,
+                atmo_tau_per_r: 0.0,
+                atmo_n_delta: 0.0,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+            SolarBody {
+                name: "Saturn",
+                radius_au: 0.50,
+                semi_major_au: 10.10,
+                eccentricity: 0.05,
+                period_s: 135.0,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: -2.55,
+                parent: None,
+                albedo: [0.80, 0.72, 0.52],
+                map_color: [232, 212, 162],
+                atmo_thickness: 0.14,
+                atmo_tau_per_r: 0.55,
+                atmo_n_delta: 0.014,
+                ring_inner_mult: 1.28,
+                ring_outer_mult: 2.35,
+                ring_angle: -0.62,
+            },
+            SolarBody {
+                name: "Uranus",
+                radius_au: 0.34,
+                semi_major_au: 11.95,
+                eccentricity: 0.04,
+                period_s: 185.0,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: 2.52,
+                parent: None,
+                albedo: [0.46, 0.76, 0.82],
+                map_color: [148, 214, 228],
+                atmo_thickness: 0.22,
+                atmo_tau_per_r: 0.95,
+                atmo_n_delta: 0.015,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+            SolarBody {
+                name: "Neptune",
+                radius_au: 0.33,
+                semi_major_au: 13.75,
+                eccentricity: 0.01,
+                period_s: 240.0,
+                arg_periapsis: 0.0,
+                mean_anomaly_0: -2.96,
+                parent: None,
+                albedo: [0.26, 0.48, 0.88],
+                map_color: [98, 142, 238],
+                atmo_thickness: 0.24,
+                atmo_tau_per_r: 1.15,
+                atmo_n_delta: 0.015,
+                ring_inner_mult: 0.0,
+                ring_outer_mult: 0.0,
+                ring_angle: 0.0,
+            },
+        ]
+    }
+
+    /// Switch cleanly between `Real (1:1)` exact NASA scale and exaggerated `Orrery` cartoon scale.
+    pub fn set_scale(&mut self, scale: SolarScale) {
+        if self.scale == scale {
+            return;
+        }
+        let prev_focus = self.focus;
+        self.scale = scale;
+        self.sim_time_s = 0.0;
+        self.bodies = match scale {
+            SolarScale::Real1To1 => Self::real_bodies(),
+            SolarScale::Orrery => Self::orrery_bodies(),
         };
-        s.update_positions();
-        // Start with a clean, awe-inspiring Earth + Moon Lunar Eclipse alignment so the
-        // first glance immediately showcases true-scale shadows, blue sky, and red umbra!
-        s.stage_lunar_eclipse();
-        s
+        self.update_positions();
+        match scale {
+            SolarScale::Orrery => self.set_focus(SolarFocus::System),
+            SolarScale::Real1To1 => {
+                if prev_focus == SolarFocus::System {
+                    self.stage_lunar_eclipse();
+                } else {
+                    self.set_focus(prev_focus);
+                }
+            }
+        }
+    }
+
+    /// Allowed camera `view_half_height_au` range for scroll zooming in the active scale mode.
+    pub fn zoom_bounds(&self) -> (f64, f64) {
+        match self.scale {
+            SolarScale::Real1To1 => (0.000_025, 45.0),
+            SolarScale::Orrery => (0.65, 24.0),
+        }
     }
 
     /// Recompute exact `f64` Keplerian positions for all bodies at `self.sim_time_s`.
@@ -473,77 +730,119 @@ impl SolarSystem {
     pub fn set_focus(&mut self, focus: SolarFocus) {
         self.focus = focus;
         self.pan_offset_au = [0.0, 0.0];
-        self.view_half_height_au = match focus {
-            SolarFocus::System => 33.5,
-            SolarFocus::Inner => 1.95,
-            SolarFocus::Body(BODY_SUN) => SUN_RADIUS_AU * 4.5,
-            SolarFocus::Body(BODY_SATURN) => self.bodies[BODY_SATURN].radius_au * 4.5,
-            SolarFocus::Body(BODY_JUPITER) => self.bodies[BODY_JUPITER].radius_au * 5.0,
-            SolarFocus::Body(idx) => {
-                let r = self.bodies.get(idx).map(|b| b.radius_au).unwrap_or(0.0001);
-                (r * 4.2).max(0.000_035)
+        let sun_r = self.bodies[BODY_SUN].radius_au;
+        match self.scale {
+            SolarScale::Real1To1 => {
+                self.view_half_height_au = match focus {
+                    SolarFocus::System => 33.5,
+                    SolarFocus::Inner => 1.95,
+                    SolarFocus::Body(BODY_SUN) => sun_r * 4.5,
+                    SolarFocus::Body(BODY_SATURN) => self.bodies[BODY_SATURN].radius_au * 4.5,
+                    SolarFocus::Body(BODY_JUPITER) => self.bodies[BODY_JUPITER].radius_au * 5.0,
+                    SolarFocus::Body(idx) => {
+                        let r = self.bodies.get(idx).map(|b| b.radius_au).unwrap_or(0.0001);
+                        (r * 4.2).max(0.000_035)
+                    }
+                };
+                self.time_warp = match focus {
+                    SolarFocus::System => 30.0 * 86_400.0,
+                    SolarFocus::Inner => 5.0 * 86_400.0,
+                    SolarFocus::Body(BODY_EARTH | BODY_MOON) => 3_600.0,
+                    SolarFocus::Body(BODY_JUPITER | BODY_IO | BODY_EUROPA) => 1_800.0,
+                    _ => 86_400.0,
+                };
             }
-        };
-        // Set a sensible orbital speed for each zoom scale so planets/moons visibly move without flying off.
-        self.time_warp = match focus {
-            SolarFocus::System => 30.0 * 86_400.0, // 30 days/s
-            SolarFocus::Inner => 5.0 * 86_400.0,   // 5 days/s
-            SolarFocus::Body(BODY_EARTH | BODY_MOON) => 3_600.0, // 1 hr/s
-            SolarFocus::Body(BODY_JUPITER | BODY_IO | BODY_EUROPA) => 1_800.0, // 30 min/s
-            _ => 86_400.0,                         // 1 day/s
-        };
+            SolarScale::Orrery => {
+                self.view_half_height_au = match focus {
+                    SolarFocus::System => 8.9,
+                    SolarFocus::Inner => 6.4,
+                    SolarFocus::Body(BODY_SUN) => sun_r * 4.5,
+                    SolarFocus::Body(BODY_SATURN) => self.bodies[BODY_SATURN].radius_au * 4.2,
+                    SolarFocus::Body(BODY_JUPITER) => self.bodies[BODY_JUPITER].radius_au * 4.5,
+                    SolarFocus::Body(idx) => {
+                        let r = self.bodies.get(idx).map(|b| b.radius_au).unwrap_or(0.3);
+                        (r * 5.2).max(1.25)
+                    }
+                };
+                self.time_warp = match focus {
+                    SolarFocus::System | SolarFocus::Inner => 1.0,
+                    _ => 0.5,
+                };
+            }
+        }
     }
 
-    /// Stage an exact true-ratio **Total Solar Eclipse** (Moon at perigee directly between Sun and Earth!).
+    /// Stage a **Total Solar Eclipse** (Moon directly between Sun and Earth).
     pub fn stage_solar_eclipse(&mut self) {
         self.sim_time_s = 0.0;
         self.update_positions();
         let earth_pos = self.body_pos_au(BODY_EARTH);
         let sun_to_earth_ang = earth_pos[1].atan2(earth_pos[0]);
-        // Place Moon's perigee directly sunward of Earth (`sun_to_earth_ang + PI`) at `M = 0` (exact perigee = 363,300 km!).
         self.bodies[BODY_MOON].arg_periapsis = sun_to_earth_ang + std::f64::consts::PI;
         self.bodies[BODY_MOON].mean_anomaly_0 = 0.0;
         self.update_positions();
 
         let moon_pos = self.body_pos_au(BODY_MOON);
-        // Frame Moon + tapering lunar umbra + Earth horizontally across the widescreen canvas.
         self.focus = SolarFocus::Body(BODY_EARTH);
-        self.pan_offset_au = [
-            0.40 * (moon_pos[0] - earth_pos[0]),
-            0.40 * (moon_pos[1] - earth_pos[1]),
-        ];
-        self.view_half_height_au = 0.001_05;
-        self.time_warp = 900.0; // 15 min/s so you can watch the umbra sweep across Earth!
+        match self.scale {
+            SolarScale::Real1To1 => {
+                self.pan_offset_au = [
+                    0.40 * (moon_pos[0] - earth_pos[0]),
+                    0.40 * (moon_pos[1] - earth_pos[1]),
+                ];
+                self.view_half_height_au = 0.001_05;
+                self.time_warp = 900.0;
+            }
+            SolarScale::Orrery => {
+                self.pan_offset_au = [
+                    0.35 * (moon_pos[0] - earth_pos[0]),
+                    0.35 * (moon_pos[1] - earth_pos[1]),
+                ];
+                self.view_half_height_au = 2.0;
+                self.time_warp = 0.25;
+            }
+        }
     }
 
-    /// Stage an exact true-ratio **Total Lunar Eclipse** (Moon behind Earth inside Earth's copper-red umbra!).
+    /// Stage a **Total Lunar Eclipse** (Moon directly behind Earth inside Earth's copper-red umbra).
     pub fn stage_lunar_eclipse(&mut self) {
         self.sim_time_s = 0.0;
         self.update_positions();
         let earth_pos = self.body_pos_au(BODY_EARTH);
         let sun_to_earth_ang = earth_pos[1].atan2(earth_pos[0]);
-        // Place Moon directly anti-sunward of Earth inside Earth's shadow cone!
         self.bodies[BODY_MOON].arg_periapsis = sun_to_earth_ang;
         self.bodies[BODY_MOON].mean_anomaly_0 = 0.0;
         self.update_positions();
 
         let moon_pos = self.body_pos_au(BODY_MOON);
         self.focus = SolarFocus::Body(BODY_EARTH);
-        self.pan_offset_au = [
-            0.70 * (moon_pos[0] - earth_pos[0]),
-            0.70 * (moon_pos[1] - earth_pos[1]),
-        ];
-        self.view_half_height_au = 0.001_18;
-        self.time_warp = 900.0;
+        match self.scale {
+            SolarScale::Real1To1 => {
+                self.pan_offset_au = [
+                    0.70 * (moon_pos[0] - earth_pos[0]),
+                    0.70 * (moon_pos[1] - earth_pos[1]),
+                ];
+                self.view_half_height_au = 0.001_18;
+                self.time_warp = 900.0;
+            }
+            SolarScale::Orrery => {
+                self.pan_offset_au = [
+                    0.45 * (moon_pos[0] - earth_pos[0]),
+                    0.45 * (moon_pos[1] - earth_pos[1]),
+                ];
+                self.view_half_height_au = 2.1;
+                self.time_warp = 0.25;
+            }
+        }
     }
 
-    /// Stage **Saturn & its true-scale C/B/A icy ring system**.
+    /// Stage **Saturn & its icy ring system**.
     pub fn stage_saturn_rings(&mut self) {
         self.set_focus(SolarFocus::Body(BODY_SATURN));
         self.view_half_height_au = self.bodies[BODY_SATURN].radius_au * 3.8;
     }
 
-    /// Stage **Io transiting directly sunward of Jupiter**, casting a sharp moon shadow onto Jupiter's clouds!
+    /// Stage **Io transiting directly sunward of Jupiter**, casting a moon shadow onto Jupiter.
     pub fn stage_jupiter_io_transit(&mut self) {
         self.sim_time_s = 0.0;
         self.update_positions();
@@ -559,11 +858,19 @@ impl SolarSystem {
             0.42 * (io_pos[0] - jup_pos[0]),
             0.42 * (io_pos[1] - jup_pos[1]),
         ];
-        self.view_half_height_au = 0.001_35;
-        self.time_warp = 600.0;
+        match self.scale {
+            SolarScale::Real1To1 => {
+                self.view_half_height_au = 0.001_35;
+                self.time_warp = 600.0;
+            }
+            SolarScale::Orrery => {
+                self.view_half_height_au = 2.5;
+                self.time_warp = 0.25;
+            }
+        }
     }
 
-    /// Sample points along body `idx`'s exact Keplerian ellipse in AU (for crisp KSP/KSA orbit guides).
+    /// Sample points along body `idx`'s exact Keplerian ellipse (for orbit guides).
     pub fn sample_orbit_ellipse_au(&self, idx: usize, num_pts: usize) -> Vec<[f64; 2]> {
         let Some(b) = self.bodies.get(idx) else {
             return Vec::new();
@@ -591,8 +898,8 @@ impl SolarSystem {
     /// Compile the `f64` Solar System into camera-centered normalized GPU primitives (`view_half_height = 1.0`).
     ///
     /// Automatically switches between direct `EMITTER_DISK` (when the Sun is inside/near the frame)
-    /// and frustum importance-sampled `EMITTER_SOLAR_FAR` (when zoomed into a planet/moon up to
-    /// 30 AU away, preserving exact solar angular diameter and sub-pixel FP32 precision!).
+    /// and frustum importance-sampled `EMITTER_SOLAR_FAR` (when zoomed into a distant planet/moon,
+    /// preserving exact solar angular diameter and sub-pixel FP32 precision).
     pub fn compile_to_gpu(&self, aspect: f64) -> SolarGpuFrame {
         let center = self.view_center_au();
         let half_h = self.view_half_height_au.max(1e-6);
@@ -608,15 +915,16 @@ impl SolarSystem {
             body_gpu_rad.push(b.radius_au * inv_s);
         }
 
+        let sun_r = self.bodies[BODY_SUN].radius_au;
         let sun_dx = center[0] - self.positions_au[BODY_SUN][0];
         let sun_dy = center[1] - self.positions_au[BODY_SUN][1];
         let sun_dist_au = (sun_dx * sun_dx + sun_dy * sun_dy).sqrt();
         let sun_dist_gpu = sun_dist_au * inv_s;
-        let sun_rad_gpu = SUN_RADIUS_AU * inv_s;
+        let sun_rad_gpu = sun_r * inv_s;
 
         // Exact angular radius of the Sun as seen from camera center.
-        let alpha_sun = if sun_dist_au > SUN_RADIUS_AU {
-            (SUN_RADIUS_AU / sun_dist_au).clamp(0.0, 1.0).asin()
+        let alpha_sun = if sun_dist_au > sun_r {
+            (sun_r / sun_dist_au).clamp(0.0, 1.0).asin()
         } else {
             std::f64::consts::FRAC_PI_2
         };
@@ -654,7 +962,7 @@ impl SolarSystem {
                 continue;
             }
             // Skip sub-microscopic dust specks when zoomed out to 35 AU so GPU intersection stays crisp
-            // (bodies remain clickable via KSP/KSA HUD markers and appear seamlessly as you zoom in).
+            // (bodies remain clickable via HUD markers and appear seamlessly as you zoom in).
             if gr < 1e-4 {
                 continue;
             }
@@ -738,17 +1046,17 @@ impl SolarSystem {
             view_center_au: center,
             sun_dist_au,
             sun_angular_diam_deg: (2.0 * alpha_sun).to_degrees(),
-            light_time_s: sun_dist_au * LIGHT_TIME_AU_S * self.scale.factor(),
+            light_time_s: sun_dist_au * LIGHT_TIME_AU_S,
             body_gpu_pos,
             body_gpu_rad,
         }
     }
 }
 
-/// Format an astronomical distance (`au`) scaled by [`SolarScale`] cleanly for HUD telemetry.
-pub fn format_distance_au(au: f64, scale: SolarScale) -> String {
-    let km = au * AU_KM * scale.factor();
-    if au >= 0.25 && scale == SolarScale::Real1To1 {
+/// Format an astronomical distance (`au`) cleanly for Real 1:1 HUD telemetry.
+pub fn format_distance_au(au: f64) -> String {
+    let km = au * AU_KM;
+    if au >= 0.25 {
         format!("{au:.2} AU")
     } else if km >= 10_000_000.0 {
         format!("{:.2}M km", km * 1e-6)
@@ -774,9 +1082,15 @@ pub fn format_duration_s(sec: f64) -> String {
     }
 }
 
-/// Format orbital time warp rate cleanly (`1x`, `15m/s`, `1d/s`, etc.).
-pub fn format_warp(warp: f64) -> String {
-    if warp < 60.0 {
+/// Format orbital time warp rate cleanly for either `Real (1:1)` or `Orrery` scale.
+pub fn format_warp(warp: f64, scale: SolarScale) -> String {
+    if scale.is_orrery() {
+        if warp < 1.0 {
+            format!("{warp:.2}x")
+        } else {
+            format!("{warp:.1}x")
+        }
+    } else if warp < 60.0 {
         format!("{warp:.0}x")
     } else if warp < 3600.0 {
         format!("{:.0}m/s", warp / 60.0)
@@ -878,6 +1192,24 @@ mod tests {
         assert!(
             d_spawn > 1.5 && d_spawn.is_finite(),
             "invalid upstream spawn distance d_spawn={d_spawn}"
+        );
+
+        // Verify exaggerated Orrery mode renders all planets, moons, atmospheres, and Saturn's rings in one view!
+        sys.set_scale(SolarScale::Orrery);
+        let orr = sys.compile_to_gpu(16.0 / 9.0);
+        assert!(
+            !orr.far_sun_mode,
+            "Orrery system view must place Sun directly on screen"
+        );
+        assert!(
+            orr.circles.len() >= 15,
+            "expected all 8 planets + 3 moons + atmospheres in Orrery view, got {}",
+            orr.circles.len()
+        );
+        assert_eq!(
+            orr.segments.len(),
+            2,
+            "expected Saturn's 2 ring segments in Orrery view"
         );
     }
 }

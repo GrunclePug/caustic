@@ -129,14 +129,15 @@ enum SolarFocusArg {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SolarScaleArg {
     Real,
-    Ksp,
+    #[value(alias = "cartoon")]
+    Orrery,
 }
 
 impl From<SolarScaleArg> for SolarScale {
     fn from(value: SolarScaleArg) -> Self {
         match value {
             SolarScaleArg::Real => Self::Real1To1,
-            SolarScaleArg::Ksp => Self::Scaled1To10,
+            SolarScaleArg::Orrery => Self::Orrery,
         }
     }
 }
@@ -272,7 +273,7 @@ struct PhotonArgs {
     #[arg(long, value_enum)]
     solar_focus: Option<SolarFocusArg>,
 
-    /// Solar System linear scale (`real` = 1:1 NASA, `ksp` = 1:10 KSP/KSA; ratios identical).
+    /// Solar System scale mode (`real` = exact 1:1 NASA ratios, `orrery` / `cartoon` = exaggerated overview).
     #[arg(long, value_enum, default_value_t = SolarScaleArg::Real)]
     solar_scale: SolarScaleArg,
 }
@@ -286,7 +287,7 @@ impl PhotonArgs {
             scene.dispersion_scale = d.clamp(0.0, 4.0);
         }
         if scene.id.is_solar_system() {
-            scene.solar.scale = self.solar_scale.into();
+            scene.solar.set_scale(self.solar_scale.into());
             if let Some(focus) = self.solar_focus {
                 match focus {
                     SolarFocusArg::LunarEclipse => scene.solar.stage_lunar_eclipse(),

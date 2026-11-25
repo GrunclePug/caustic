@@ -61,7 +61,7 @@ impl StudioMode {
     pub fn category_badge(self) -> &'static str {
         match self {
             Self::BlackHole3D => "3D RELATIVITY",
-            Self::Photons(PhotonSceneId::SolarSystem) => "TRUE-RATIO SOLAR",
+            Self::Photons(PhotonSceneId::SolarSystem) => "SOLAR SYSTEM",
             Self::Photons(PhotonSceneId::Sandbox) => "PLAYGROUND",
             Self::Photons(id) => match id.category() {
                 SceneCategory::Optics => "OPTICAL BENCH",
@@ -510,8 +510,13 @@ impl StudioApp {
                 }
                 StudioMode::Photons(id) => {
                     if id.is_solar_system() {
+                        let (lo, hi) = if self.photon_scene.solar.scale.is_orrery() {
+                            (0.1, 16.0)
+                        } else {
+                            (1.0, 5_000_000.0)
+                        };
                         self.photon_scene.solar.time_warp =
-                            (self.photon_scene.solar.time_warp * 2.0).clamp(1.0, 5_000_000.0);
+                            (self.photon_scene.solar.time_warp * 2.0).clamp(lo, hi);
                     } else if id.is_kerr() {
                         self.photon_scene.spin =
                             (self.photon_scene.spin + 0.05).clamp(-0.998, 0.998);
@@ -530,8 +535,13 @@ impl StudioApp {
                 }
                 StudioMode::Photons(id) => {
                     if id.is_solar_system() {
+                        let (lo, hi) = if self.photon_scene.solar.scale.is_orrery() {
+                            (0.1, 16.0)
+                        } else {
+                            (1.0, 5_000_000.0)
+                        };
                         self.photon_scene.solar.time_warp =
-                            (self.photon_scene.solar.time_warp * 0.5).clamp(1.0, 5_000_000.0);
+                            (self.photon_scene.solar.time_warp * 0.5).clamp(lo, hi);
                     } else if id.is_kerr() {
                         self.photon_scene.spin =
                             (self.photon_scene.spin - 0.05).clamp(-0.998, 0.998);
@@ -951,12 +961,13 @@ impl StudioApp {
                                         });
                                     }
                                     StudioMode::Photons(id) => {
-                                        // KSP/KSA True-Ratio Solar System controls (compact so all controls + telemetry fit cleanly)
+                                        // Solar System controls: Real (1:1) exact NASA ratios vs exaggerated Orrery scale
                                         if id.is_solar_system() {
                                             ui.spacing_mut().item_spacing.y = 4.5;
+                                            let is_orrery =
+                                                self.photon_scene.solar.scale.is_orrery();
                                             ui.horizontal(|ui| {
-                                                for sc in
-                                                    [SolarScale::Real1To1, SolarScale::Scaled1To10]
+                                                for sc in [SolarScale::Real1To1, SolarScale::Orrery]
                                                 {
                                                     if mode_chip(
                                                         ui,
@@ -964,7 +975,7 @@ impl StudioApp {
                                                         self.photon_scene.solar.scale == sc,
                                                     ) && self.photon_scene.solar.scale != sc
                                                     {
-                                                        self.photon_scene.solar.scale = sc;
+                                                        self.photon_scene.solar.set_scale(sc);
                                                         actions.solar_changed = true;
                                                     }
                                                 }
@@ -1045,6 +1056,7 @@ impl StudioApp {
                                                         ui.label(
                                                             RichText::new(format_warp(
                                                                 self.photon_scene.solar.time_warp,
+                                                                self.photon_scene.solar.scale,
                                                             ))
                                                             .monospace()
                                                             .size(10.5)
@@ -1059,18 +1071,29 @@ impl StudioApp {
                                                 ui.spacing_mut().item_spacing = Vec2::new(2.5, 2.5);
                                                 ui.spacing_mut().button_padding =
                                                     Vec2::new(5.0, 2.2);
-                                                for (lbl, wv) in [
-                                                    ("1x", 1.0),
-                                                    ("1m", 60.0),
-                                                    ("15m", 900.0),
-                                                    ("1h", 3_600.0),
-                                                    ("1d", 86_400.0),
-                                                    ("30d", 30.0 * 86_400.0),
-                                                ] {
+                                                let presets: &[(&str, f64)] = if is_orrery {
+                                                    &[
+                                                        ("0.25x", 0.25),
+                                                        ("0.5x", 0.5),
+                                                        ("1x", 1.0),
+                                                        ("2x", 2.0),
+                                                        ("5x", 5.0),
+                                                    ]
+                                                } else {
+                                                    &[
+                                                        ("1x", 1.0),
+                                                        ("1m", 60.0),
+                                                        ("15m", 900.0),
+                                                        ("1h", 3_600.0),
+                                                        ("1d", 86_400.0),
+                                                        ("30d", 30.0 * 86_400.0),
+                                                    ]
+                                                };
+                                                for &(lbl, wv) in presets {
                                                     let sel = (self.photon_scene.solar.time_warp
                                                         - wv)
                                                         .abs()
-                                                        / wv.max(1.0)
+                                                        / wv.max(0.01)
                                                         < 0.12;
                                                     if mode_chip(ui, lbl, sel) {
                                                         self.photon_scene.solar.time_warp = wv;
@@ -1079,39 +1102,47 @@ impl StudioApp {
                                             });
 
                                             if let Some(sf) = &self.photon_scene.last_solar_frame {
-                                                let sc = self.photon_scene.solar.scale;
                                                 card_frame().show(ui, |ui| {
                                                     ui.spacing_mut().item_spacing.y = 2.5;
-                                                    let rows = [
-                                                        (
-                                                            "View Height",
-                                                            format_distance_au(
-                                                                2.0 * sf.view_half_height_au,
-                                                                sc,
+                                                    let rows: Vec<(&str, String)> = if is_orrery {
+                                                        vec![
+                                                            ("Scale", "Orrery (Cartoon)".into()),
+                                                            (
+                                                                "Bodies",
+                                                                "Sun + 8 Planets + 3 Moons".into(),
                                                             ),
-                                                        ),
-                                                        (
-                                                            "Sun Dist",
-                                                            format_distance_au(sf.sun_dist_au, sc),
-                                                        ),
-                                                        (
-                                                            "Sun Angular Ø",
-                                                            if sf.sun_dist_au
-                                                                <= SUN_RADIUS_AU * 1.05
-                                                            {
-                                                                "—".to_string()
-                                                            } else {
-                                                                format!(
-                                                                    "{:.4}°",
-                                                                    sf.sun_angular_diam_deg
-                                                                )
-                                                            },
-                                                        ),
-                                                        (
-                                                            "Light Time",
-                                                            format_duration_s(sf.light_time_s),
-                                                        ),
-                                                    ];
+                                                        ]
+                                                    } else {
+                                                        vec![
+                                                            (
+                                                                "View Height",
+                                                                format_distance_au(
+                                                                    2.0 * sf.view_half_height_au,
+                                                                ),
+                                                            ),
+                                                            (
+                                                                "Sun Dist",
+                                                                format_distance_au(sf.sun_dist_au),
+                                                            ),
+                                                            (
+                                                                "Sun Angular Ø",
+                                                                if sf.sun_dist_au
+                                                                    <= SUN_RADIUS_AU * 1.05
+                                                                {
+                                                                    "—".to_string()
+                                                                } else {
+                                                                    format!(
+                                                                        "{:.4}°",
+                                                                        sf.sun_angular_diam_deg
+                                                                    )
+                                                                },
+                                                            ),
+                                                            (
+                                                                "Light Time",
+                                                                format_duration_s(sf.light_time_s),
+                                                            ),
+                                                        ]
+                                                    };
                                                     for (k, v) in rows {
                                                         ui.horizontal(|ui| {
                                                             ui.label(
@@ -2597,11 +2628,11 @@ impl ApplicationHandler for StudioApp {
                         self.bh_last_input = Instant::now();
                     }
                     StudioMode::Photons(PhotonSceneId::SolarSystem) => {
-                        // Seamless floating-origin zoom across >6 orders of magnitude (45 AU down to ~7,500 km!).
+                        let (z_min, z_max) = self.photon_scene.solar.zoom_bounds();
                         let factor = (-f64::from(scroll) * 0.14).exp();
                         self.photon_scene.solar.view_half_height_au =
                             (self.photon_scene.solar.view_half_height_au * factor)
-                                .clamp(0.000_025, 45.0);
+                                .clamp(z_min, z_max);
                         self.sync_solar_scene(true, false);
                         self.photon_last_edit = Instant::now();
                     }

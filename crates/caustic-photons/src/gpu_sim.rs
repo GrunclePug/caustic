@@ -646,10 +646,13 @@ impl PhotonPipeline {
             .last_solar_frame
             .as_ref()
             .is_some_and(|sf| sf.far_sun_mode);
+        let solar_orrery = scene.solar.scale.is_orrery();
         let gain_k = match (settings.mode, phys, scene.id.is_solar_system()) {
             (PhotonMode::Accumulate, PhysicsKind::Optics, true) => {
                 if solar_far {
                     0.26
+                } else if solar_orrery {
+                    0.44
                 } else {
                     0.30
                 }
@@ -661,6 +664,8 @@ impl PhotonPipeline {
             (PhotonMode::Pulse, _, true) => {
                 if solar_far {
                     1.15
+                } else if solar_orrery {
+                    1.25
                 } else {
                     0.95
                 }
